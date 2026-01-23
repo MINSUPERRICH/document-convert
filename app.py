@@ -1,109 +1,158 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+import pytesseract
+from pdf2image import convert_from_bytes
 import io
+import re
 
-# 1. Page Setup
-st.set_page_config(page_title="PDF/Scan to Excel & Subtotal", layout="wide")
-st.title("📄 PDF to Excel Converter with Subtotals")
+# ------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------
+st.set_page_config(page_title="Scan to Excel + Subtotals", layout="wide")
+st.title("📸 Scanned PDF to Excel with Subtotals")
 
-# 2. File Upload
-uploaded_file = st.file_uploader("Upload your PDF file", type=["pdf"])
+# NOTE: If running locally (not on Cloud), you might need to point 
+# to your tesseract installation path manually, e.g.:
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-def extract_table_from_pdf(file):
+# ------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------
+
+def process_scan_to_text(file_bytes):
     """
-    Attempts to extract the largest table from the first page of the PDF.
+    Converts PDF bytes to images, then runs OCR on the images.
+    Returns a single string of all text found.
     """
-    with pdfplumber.open(file) as pdf:
-        # Look at the first page (you can loop through pages if needed)
-        page = pdf.pages[0] 
-        # Extract table
-        table = page.extract_table()
-        
-    if table:
-        # Convert list of lists to DataFrame
-        # Assume first row is header
-        df = pd.DataFrame(table[1:], columns=table[0])
-        return df
-    else:
+    # 1. Convert PDF to a list of images (one per page)
+    try:
+        images = convert_from_bytes(file_bytes)
+    except Exception as e:
+        st.error(f"Error converting PDF to image. Is Poppler installed? Error: {e}")
+        return ""
+
+    full_text = ""
+    
+    # 2. Run Tesseract OCR on each page image
+    # progress bar for multi-page docs
+    progress_bar = st.progress(0)
+    for i, image in enumerate(images):
+        # psm 6 = Assume a single uniform block of text (good for tables)
+        text = pytesseract.image_to_string(image, config='--psm 6')
+        full_text += text + "\n"
+        progress_bar.progress((i + 1) / len(images))
+    
+    progress_bar.empty()
+    return full_text
+
+def text_to_dataframe(text):
+    """
+    Parses raw OCR text into a DataFrame.
+    Assumes columns are separated by multiple spaces.
+    """
+    lines = text.split('\n')
+    data = []
+    
+    for line in lines:
+        if line.strip():  # Skip empty lines
+            # Split by 2 or more spaces to find columns
+            row = re.split(r'\s{2,}', line.strip())
+            data.append(row)
+
+    if not data:
         return None
 
-# 3. Main Logic
-if uploaded_file is not None:
-    st.write("Processing file...")
+    # Determine max columns to normalize row lengths
+    max_cols = max(len(row) for row in data)
     
-    # Attempt extraction
-    try:
-        df = extract_table_from_pdf(uploaded_file)
-        
-        if df is None:
-            st.error("Could not detect a table. Is this a scanned image? (See note below)")
-        else:
-            st.success("Table extracted successfully!")
-            
-            # 4. Data Cleaning & Display
-            st.subheader("1. Review and Edit Data")
-            st.markdown("Use the table below to fix any conversion errors before calculating.")
-            
-            # Convert columns to numeric if possible (for calculations)
-            # This logic tries to auto-convert numbers
-            for col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='ignore')
+    # Pad shorter rows with None so pandas doesn't crash
+    normalized_data = [row + [None] * (max_cols - len(row)) for row in data]
+    
+    # Assume first row is header
+    df = pd.DataFrame(normalized_data[1:], columns=normalized_data[0])
+    return df
 
-            # Allow user to edit data directly in the browser
-            edited_df = st.data_editor(df, num_rows="dynamic")
+# ------------------------------------------------------------------
+# MAIN APP LOGIC
+# ------------------------------------------------------------------
+
+uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
+
+if uploaded_file is not None:
+    st.info("Reading scanned image... this may take a moment.")
+    
+    # Read file bytes
+    file_bytes = uploaded_file.read()
+    
+    # 1. OCR Extraction
+    raw_text = process_scan_to_text(file_bytes)
+    
+    if raw_text:
+        # 2. Convert to Table
+        df = text_to_dataframe(raw_text)
+        
+        if df is not None:
+            st.success("Scan processed!")
+            
+            st.subheader("1. Verify & Edit Data")
+            st.caption("OCR can be messy. Please correct column headers and values below before calculating.")
+
+            # Try to convert numbers automatically
+            for col in df.columns:
+                # Remove currency symbols or commas for conversion
+                clean_col = df[col].astype(str).str.replace(r'[$,]', '', regex=True)
+                df[col] = pd.to_numeric(clean_col, errors='ignore')
+
+            # The Editable Grid
+            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
             st.divider()
 
-            # 5. Subtotal Calculation Logic
+            # 3. Calculation Logic
             st.subheader("2. Calculate Subtotals")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                group_col = st.selectbox("Group By (Category):", options=["Select..."] + list(edited_df.columns))
             
-            col1, col2 = st.columns(2)
+            with c2:
+                # Filter for numeric columns only for the sum operation
+                numeric_cols = edited_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+                sum_col = st.selectbox("Calculate Sum For (Value):", options=["Select..."] + numeric_cols)
+
+            if group_col != "Select..." and sum_col != "Select...":
+                try:
+                    # Calculation
+                    subtotal_df = edited_df.groupby(group_col)[sum_col].sum().reset_index()
+                    
+                    # Formatting
+                    subtotal_df.rename(columns={sum_col: f"Total {sum_col}"}, inplace=True)
+                    
+                    # Show results
+                    st.write("### Subtotal Results")
+                    st.dataframe(subtotal_df, use_container_width=True)
+
+                    # 4. Export
+                    st.divider()
+                    st.subheader("3. Download Results")
+                    
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        edited_df.to_excel(writer, sheet_name='Cleaned Data', index=False)
+                        subtotal_df.to_excel(writer, sheet_name='Subtotals', index=False)
+                        
+                    st.download_button(
+                        label="📥 Download Excel File",
+                        data=output.getvalue(),
+                        file_name="scanned_data_subtotals.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.error(f"Calculation Error: {e}. Please check if the 'Value' column contains non-numbers.")
             
-            with col1:
-                # User picks the "Category" column (e.g., 'Department' or 'Date')
-                group_col = st.selectbox("Select column to group by (Category):", edited_df.columns)
-            
-            with col2:
-                # User picks the "Value" column (e.g., 'Amount' or 'Price')
-                # We filter to only show numeric columns
-                numeric_cols = edited_df.select_dtypes(include=['float64', 'int64']).columns
-                value_col = st.selectbox("Select column to sum (Value):", numeric_cols)
-
-            if group_col and value_col:
-                # Perform the calculation
-                summary_df = edited_df.groupby(group_col)[value_col].sum().reset_index()
-                
-                # Format for display (add subtotal label)
-                summary_df.columns = [group_col, f"Total {value_col}"]
-                
-                st.write("### Results")
-                st.dataframe(summary_df)
-
-                # 6. Download Button
-                st.divider()
-                st.subheader("3. Download Result")
-                
-                # Create Excel in memory
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    edited_df.to_excel(writer, sheet_name='Raw Data', index=False)
-                    summary_df.to_excel(writer, sheet_name='Subtotals', index=False)
-                
-                st.download_button(
-                    label="Download Excel File",
-                    data=output.getvalue(),
-                    file_name="converted_data_with_subtotals.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
-
-else:
-    st.info("Please upload a PDF file containing a table to get started.")
-    
-    st.markdown("""
-    **Note on Scanned Files:** If your PDF is a *picture* of a document (a flat scan), standard extraction won't work. 
-    You will need to integrate OCR (Tesseract) which is more complex to set up.
-    """)
+        else:
+            st.error("OCR found text, but couldn't identify a table structure. Try a clearer scan.")
+            with st.expander("See raw text detected"):
+                st.text(raw_text)
+    else:
+        st.error("No text detected. The image might be too blurry or blank.")
