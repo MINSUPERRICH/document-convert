@@ -20,7 +20,6 @@ tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 with tab1:
     st.header("1. Scan PDF to Excel")
     
-    # --- HELPER: PIXEL ALIGNMENT ALGORITHM ---
     def process_layout_preserving(image, clustering_sensitivity=15):
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
         df = pd.DataFrame(data)
@@ -70,7 +69,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (With Rounding on Load)
+# TAB 2: AI ANALYZER (Updated "Smart" Logic)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -78,34 +77,28 @@ with tab2:
     uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
     
     if uploaded_excel:
-        # 1. HEADER SELECTION
-        st.info("Check the preview below. If headers are wrong, change the 'Header Row Number'.")
-        header_row_idx = st.number_input("Header Row Number (0 = First Row)", min_value=0, max_value=20, value=0)
+        st.info("If your columns look wrong (e.g. Unnamed: 0), increase the Header Row Number.")
+        header_row_idx = st.number_input("Header Row Number", min_value=0, max_value=20, value=0)
         
-        # Load Data
+        # Load and clean decimals immediately
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
-        
-        # ---> FIX 1: ROUND ON LOAD <---
-        # Immediately find all number columns and round them to 2 places
-        # This fixes the "2796.62625" issue before you even calculate.
         numeric_cols = df_excel.select_dtypes(include=['float', 'float64']).columns
         df_excel[numeric_cols] = df_excel[numeric_cols].round(2)
 
-        # Display Preview
         with st.expander("👀 View Data Preview", expanded=True):
             st.dataframe(df_excel.head())
-            st.caption(f"Active Columns: {', '.join(list(df_excel.columns))}")
+            # List valid columns so user knows what names to type
+            st.caption(f"**Valid Column Names:** {', '.join(list(df_excel.columns))}")
 
         st.divider()
 
-        # 2. CHAT INTERFACE
         st.subheader("What do you want to calculate?")
-        user_query = st.text_input("Direction:", placeholder="e.g. Sort by class, then sum of Amount")
+        user_query = st.text_input("Direction:", placeholder="e.g. Sort by Date. Sum all columns by Class.")
         run_calc = st.button("🚀 Run", type="primary")
 
-        # 3. MULTI-STEP PARSER
         if run_calc and user_query:
             
+            # Split instructions by common separators
             steps = re.split(r'[.;]| then | after that | and ', user_query, flags=re.IGNORECASE)
             steps = [s.strip() for s in steps if s.strip()]
             
@@ -117,19 +110,22 @@ with tab2:
                 for step in steps:
                     step_lower = step.lower()
                     
-                    # Match Columns
+                    # 1. Match Columns (Case Insensitive)
                     col_map = {c.lower(): c for c in current_df.columns}
                     sorted_cols = sorted(col_map.keys(), key=len, reverse=True)
+                    # Find any column names present in the user's sentence
                     found_cols = [col_map[c] for c in sorted_cols if c in step_lower]
                     
-                    # Identify Op
+                    # 2. Identify Operation
                     op = None
                     if 'sort' in step_lower: op = 'sort'
-                    elif any(x in step_lower for x in ['sum', 'total', 'add']): op = 'sum'
+                    elif any(x in step_lower for x in ['sum', 'total', 'add', 'subtotal']): op = 'sum'
                     elif any(x in step_lower for x in ['avg', 'average']): op = 'mean'
                     elif any(x in step_lower for x in ['count']): op = 'count'
                     
-                    # Execution
+                    # 3. EXECUTE LOGIC
+                    
+                    # --- CASE A: SORTING ---
                     if op == 'sort' and found_cols:
                         target = found_cols[0]
                         ascending = False if 'desc' in step_lower else True
@@ -137,53 +133,81 @@ with tab2:
                         log_messages.append(f"✅ Sorted by **{target}**")
                         final_result = current_df 
 
-                    elif op in ['sum', 'mean', 'count'] and found_cols:
-                        val_col = found_cols[0] 
+                    # --- CASE B: GROUP BY (SUBTOTALS) ---
+                    elif op in ['sum', 'mean', 'count']:
                         
-                        # Clean numbers again just in case calculation introduces new decimals
-                        clean_df = current_df.copy()
-                        clean_df[val_col] = pd.to_numeric(
-                            clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-                            errors='coerce'
-                        ).fillna(0)
-
-                        if 'by' in step_lower and len(found_cols) > 1:
-                            # Group By
+                        # Identify the GROUP column (after the word "by")
+                        group_col = None
+                        if 'by' in step_lower:
                             parts = step_lower.split('by')
+                            # Check if a found column is in the "after 'by'" part
                             group_candidates = [c for c in found_cols if c.lower() in parts[1]]
-                            
                             if group_candidates:
                                 group_col = group_candidates[0]
-                                val_col = [c for c in found_cols if c != group_col][0]
-                                
-                                res = clean_df.groupby(group_col)[val_col].agg(op)
-                                res_df = res.reset_index()
-                                res_df.columns = [group_col, f"{op.title()} of {val_col}"]
-                                final_result = res_df
-                                log_messages.append(f"✅ Calculated **{op}** of **{val_col}** by **{group_col}**")
-                        else:
-                            # Simple Total
-                            val = clean_df[val_col].agg(op)
-                            final_result = pd.DataFrame({f"{op.title()} of {val_col}": [val]})
-                            log_messages.append(f"✅ Calculated total **{op}** of **{val_col}**")
+                        
+                        if group_col:
+                            # We found a group column. Now, WHICH columns do we calculate?
                             
-                # 4. FINAL CLEANUP
-                for msg in log_messages:
-                    st.write(msg)
-                
-                if final_result is not None:
-                    # ---> FIX 2: ROUND RESULT <---
-                    res_numeric_cols = final_result.select_dtypes(include=['float', 'float64']).columns
-                    final_result[res_numeric_cols] = final_result[res_numeric_cols].round(2)
-
-                    st.dataframe(final_result, use_container_width=True)
-                    
-                    out = io.BytesIO()
-                    with pd.ExcelWriter(out, engine='openpyxl') as writer:
-                        final_result.to_excel(writer, index=False)
-                    st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
-                else:
-                    st.warning("I processed the steps but couldn't generate a result. Please check column names.")
+                            # 1. Identify Numeric Columns Only
+                            # Remove non-numeric symbols first to be safe
+                            for c in current_df.columns:
+                                if c != group_col:
+                                    current_df[c] = pd.to_numeric(
+                                        current_df[c].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
+                                        errors='coerce'
+                                    )
+                            
+                            # 2. Did user specify a column? OR did they say "all"/"each"?
+                            val_cols = [c for c in found_cols if c != group_col]
+                            
+                            target_cols = []
+                            if 'all' in step_lower or 'each' in step_lower or not val_cols:
+                                # TARGET = ALL NUMERIC COLUMNS
+                                target_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
+                                # Don't sum the group column itself
+                                if group_col in target_cols: target_cols.remove(group_col)
+                            else:
+                                # TARGET = SPECIFIC COLUMNS FOUND
+                                target_cols = val_cols
+                            
+                            if target_cols:
+                                # Perform Calculation
+                                res = current_df.groupby(group_col)[target_cols].agg(op)
+                                res_df = res.reset_index()
+                                # Rename columns for clarity
+                                res_df.columns = [group_col] + [f"{op.title()} of {c}" for c in target_cols]
+                                final_result = res_df
+                                log_messages.append(f"✅ Calculated **{op}** for **{len(target_cols)} columns** by **{group_col}**")
+                            else:
+                                log_messages.append("⚠️ Found the group column, but no numeric columns to calculate.")
+                        
+                        else:
+                            # --- CASE C: SIMPLE TOTAL (No Group By) ---
+                            # If no 'by', just sum the specific column mentioned
+                            if found_cols:
+                                target = found_cols[0]
+                                clean_series = pd.to_numeric(current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
+                                val = clean_series.agg(op)
+                                final_result = pd.DataFrame({f"{op.title()} of {target}": [val]})
+                                log_messages.append(f"✅ Calculated total **{op}** of **{target}**")
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
+
+            # 4. FINAL DISPLAY
+            for msg in log_messages:
+                st.write(msg)
+            
+            if final_result is not None:
+                # Round results again for clean display
+                res_numeric = final_result.select_dtypes(include=['float', 'float64']).columns
+                final_result[res_numeric] = final_result[res_numeric].round(2)
+
+                st.dataframe(final_result, use_container_width=True)
+                
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                    final_result.to_excel(writer, index=False)
+                st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
+            else:
+                st.warning("I processed the steps but couldn't generate a result. Check your column names spelling.")
