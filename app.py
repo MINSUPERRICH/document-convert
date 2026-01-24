@@ -4,155 +4,202 @@ import pytesseract
 from pdf2image import convert_from_bytes
 import io
 import re
+from PIL import Image, ImageOps
 
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Scan to Excel + Subtotals", layout="wide")
-st.title("📸 Scanned PDF to Excel with Subtotals")
+st.set_page_config(page_title="Smart Invoice to Excel", layout="wide")
+st.title("📄 Smart Invoice/Scan to Excel")
 
 # ------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER: IMAGE PROCESSING
 # ------------------------------------------------------------------
 
-def process_scan_to_text(file_bytes):
-    """ Converts PDF to text using OCR """
+def process_image_for_ocr(image):
+    """
+    Makes the image black & white and 2x larger.
+    This helps OCR read small invoice numbers drastically better.
+    """
+    # 1. Grayscale
+    image = ImageOps.grayscale(image)
+    # 2. Resize (Double resolution)
+    width, height = image.size
+    image = image.resize((width * 2, height * 2), Image.Resampling.LANCZOS)
+    return image
+
+def extract_text_from_pdf(file_bytes):
+    """ Converts PDF to Image -> Pre-process -> OCR """
     try:
         images = convert_from_bytes(file_bytes)
     except Exception as e:
-        st.error(f"Error converting PDF to image: {e}")
+        st.error(f"Error reading PDF: {e}")
         return ""
 
     full_text = ""
-    progress_bar = st.progress(0)
+    progress = st.progress(0)
     
-    for i, image in enumerate(images):
-        # We use standard psm 6 to get raw lines
-        text = pytesseract.image_to_string(image, config='--psm 6')
+    for i, img in enumerate(images):
+        # Optimize image for tables
+        processed_img = process_image_for_ocr(img)
+        
+        # --psm 6: Assume a single uniform block of text
+        text = pytesseract.image_to_string(processed_img, config='--psm 6')
         full_text += text + "\n"
-        progress_bar.progress((i + 1) / len(images))
-    
-    progress_bar.empty()
+        progress.progress((i + 1) / len(images))
+        
+    progress.empty()
     return full_text
 
-def raw_text_to_initial_df(text):
+# ------------------------------------------------------------------
+# HELPER: PARSING LOGIC (THE FIX)
+# ------------------------------------------------------------------
+
+def parse_invoice_mode(text):
     """
-    Just dumps text into a single column DataFrame initially.
-    We will let pandas split it later.
+    SMART MODE: Instead of splitting by space, we look for the Price 
+    at the end of the line and assume everything else is description.
     """
     lines = text.split('\n')
-    # Filter out empty lines
-    lines = [line.strip() for line in lines if line.strip()]
-    return pd.DataFrame(lines, columns=["Raw_Text"])
+    data = []
 
-# ------------------------------------------------------------------
-# MAIN APP LOGIC
-# ------------------------------------------------------------------
+    # Regex to find a price at the end of a line 
+    # Examples: "1,234.56" or "500.00" or "$123.45"
+    # It looks for: Numbers + optional comma + dot + 2 digits + End of String
+    price_pattern = re.compile(r'[\$]?([0-9,]+\.[0-9]{2})$')
 
-if 'df_main' not in st.session_state:
-    st.session_state.df_main = None
-
-uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
-
-if uploaded_file is not None:
-    
-    # 1. READ FILE (Only once)
-    if st.session_state.df_main is None:
-        with st.spinner("Scanning document..."):
-            file_bytes = uploaded_file.read()
-            raw_text = process_scan_to_text(file_bytes)
-            st.session_state.df_main = raw_text_to_initial_df(raw_text)
-
-    df = st.session_state.df_main.copy()
-    
-    if not df.empty:
-        st.divider()
-
-        # -------------------------------------------------------
-        # SECTION 1: DATA CLEANUP (THE FIX)
-        # -------------------------------------------------------
-        st.subheader("1. Clean Up Structure")
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.markdown("""
-            **Does your data look stuck in one column?** Click the button below to force-split the text by spaces.
-            """)
+    for line in lines:
+        clean_line = line.strip()
+        if not clean_line:
+            continue
             
-            # THE MAGIC BUTTON: Splits "Col_1" into "0, 1, 2, 3..."
-            if st.button("✂️ Split Text into Columns"):
-                # Split by whitespace
-                df_split = df.iloc[:, 0].str.split(expand=True)
-                
-                # Update the main dataframe in session state
-                st.session_state.df_main = df_split
-                st.rerun()
+        # 1. Search for price at the end
+        match = price_pattern.search(clean_line)
+        
+        if match:
+            # We found a Price! 
+            price_str = match.group(1) # The number part
+            
+            # The description is everything BEFORE the price
+            # We remove the price from the line to get the rest
+            description_part = clean_line[:match.start()].strip()
+            
+            # Clean up the price (remove commas for math)
+            numeric_value = float(price_str.replace(',', ''))
+            
+            data.append({
+                "Full_Row_Text": description_part,  # Keep context
+                "Extracted_Value": numeric_value
+            })
+        else:
+            # If no price found, we add it as a "Text Only" row (header or notes)
+            # We skip short noise (like "4W" on its own if it has no price)
+            if len(clean_line) > 3:
+                data.append({
+                    "Full_Row_Text": clean_line,
+                    "Extracted_Value": 0.0
+                })
 
-            if st.button("↺ Reset to Original"):
-                st.session_state.df_main = None
-                st.rerun()
+    return pd.DataFrame(data)
 
-        # Display the current state of the data
-        st.write("Current Data Preview:")
-        st.dataframe(df.head(5), use_container_width=True)
+def parse_simple_mode(text):
+    """ ORIGINAL MODE: Split by spaces (Good for simple lists) """
+    lines = text.split('\n')
+    data = []
+    for line in lines:
+        if line.strip():
+            row = re.split(r'\s{2,}', line.strip()) # Split by 2+ spaces
+            data.append(row)
+    
+    # Normalize
+    if data:
+        max_cols = max(len(r) for r in data)
+        data = [r + [''] * (max_cols - len(r)) for r in data]
+        return pd.DataFrame(data, columns=[f"Col_{i}" for i in range(max_cols)])
+    return pd.DataFrame()
 
-        # -------------------------------------------------------
-        # SECTION 2: DEFINE COLUMNS
-        # -------------------------------------------------------
+# ------------------------------------------------------------------
+# MAIN APP
+# ------------------------------------------------------------------
+
+if 'ocr_cache' not in st.session_state:
+    st.session_state.ocr_cache = ""
+
+uploaded_file = st.file_uploader("Upload PDF Invoice/Scan", type=["pdf"])
+
+if uploaded_file:
+    # 1. RUN OCR (If new file)
+    if st.session_state.ocr_cache == "":
+        st.info("Scanning & Enhancing Image...")
+        file_bytes = uploaded_file.read()
+        st.session_state.ocr_cache = extract_text_from_pdf(file_bytes)
+
+    raw_text = st.session_state.ocr_cache
+
+    if raw_text:
         st.divider()
-        st.subheader("2. Select Columns")
         
-        # Get list of current column names (0, 1, 2, 3...)
-        cols = list(df.columns)
+        # 2. CHOOSE MODE
+        st.subheader("1. Extraction Strategy")
+        mode = st.radio(
+            "Select how to read this file:",
+            ["Smart Invoice Mode (Best for your file)", "Simple Table Mode"],
+            horizontal=True
+        )
         
-        c1, c2 = st.columns(2)
-        with c1:
-            cat_col = st.selectbox("Category Column (Group By):", ["Select..."] + cols)
-        with c2:
-            val_col = st.selectbox("Value Column (to Sum):", ["Select..."] + cols)
+        st.caption("ℹ️ **Smart Mode** looks for a price at the end of every line (e.g. 3,780.89) and aligns the row automatically.")
 
-        # -------------------------------------------------------
-        # SECTION 3: EDIT & CALCULATE
-        # -------------------------------------------------------
-        st.divider()
-        st.subheader("3. Verify & Download")
-        
-        # Allow editing
-        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-
-        if cat_col != "Select..." and val_col != "Select...":
-            if cat_col == val_col:
-                st.warning("Please pick different columns for Category and Value.")
-            else:
-                try:
-                    # CLEANUP LOGIC:
-                    # 1. Convert Value column to numeric (force errors to NaN)
-                    # Remove '$', ',', and spaces
-                    clean_vals = edited_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True)
-                    edited_df[f"Clean_{val_col}"] = pd.to_numeric(clean_vals, errors='coerce').fillna(0)
-
-                    # 2. Group By
-                    summary_df = edited_df.groupby(cat_col)[f"Clean_{val_col}"].sum().reset_index()
-                    
-                    # 3. Rename for display
-                    summary_df.columns = ["Category", "Total Amount"]
-
-                    st.success("Calculation Successful!")
-                    st.dataframe(summary_df, use_container_width=True)
-
-                    # 4. Download
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        edited_df.to_excel(writer, sheet_name='Raw Data', index=False)
-                        summary_df.to_excel(writer, sheet_name='Subtotals', index=False)
-
-                    st.download_button(
-                        label="📥 Download Excel Result",
-                        data=output.getvalue(),
-                        file_name="converted_scan.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # 3. PARSE DATA
+        if mode.startswith("Smart"):
+            df = parse_invoice_mode(raw_text)
+            
+            # Show the result immediately
+            st.subheader("2. Verify Data")
+            
+            # Allow user to edit
+            edited_df = st.data_editor(
+                df, 
+                num_rows="dynamic", 
+                use_container_width=True,
+                column_config={
+                    "Extracted_Value": st.column_config.NumberColumn(
+                        "Amount",
+                        format="$%.2f"
+                    ),
+                    "Full_Row_Text": st.column_config.TextColumn(
+                        "Description / Details",
+                        width="large"
                     )
+                }
+            )
+            
+            # CALCULATE
+            st.divider()
+            st.subheader("3. Subtotals")
+            
+            # Since we already separated Description and Value, we just need to Group
+            # However, for Invoices, usually you just want the Grand Total or filter by Text
+            
+            total_sum = edited_df["Extracted_Value"].sum()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(label="Grand Total", value=f"${total_sum:,.2f}")
+            
+            # Export
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                edited_df.to_excel(writer, sheet_name='Invoice Data', index=False)
+            
+            st.download_button("📥 Download Excel", output.getvalue(), "invoice_smart_export.xlsx")
 
-                except Exception as e:
-                    st.error(f"Could not calculate: {e}")
+        else:
+            # Fallback to the old way if Smart Mode fails
+            df = parse_simple_mode(raw_text)
+            st.write("Raw Columns Detected:")
+            st.data_editor(df)
+            st.warning("Switch to 'Smart Invoice Mode' above for better results with prices.")
+
+    if st.button("Reset / New File"):
+        st.session_state.ocr_cache = ""
+        st.rerun()
