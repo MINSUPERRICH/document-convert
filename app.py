@@ -16,25 +16,26 @@ st.title("🧠 Smart Scan & Analyze Tool")
 tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 
 # ------------------------------------------------------------------
-# HELPER: STRICT "INVOICE STYLE" ROUNDING
+# HELPER: PRECISION ROUNDING (The Fix)
 # ------------------------------------------------------------------
 def strict_invoice_round(x):
     """
-    Simulates a human typing numbers from a paper invoice.
-    1. Cleans hidden float artifacts (e.g. 1.00499999 -> 1.005)
-    2. Rounds to exactly 2 decimal places UP (Standard Rounding)
+    Rounds a number to exactly 2 decimal places using standard arithmetic rounding.
+    Fixes 'Double Rounding' bugs by converting the raw value directly.
     """
     try:
+        # Check for empty or non-numeric
         if pd.isna(x) or str(x).strip() == "":
             return 0.0
         
-        # Step 1: Format to string to remove binary float noise
-        # This ensures 147.015000001 is treated as "147.01500"
-        clean_str = "{:.6f}".format(float(x))
+        # Convert directly to string to preserve raw precision (e.g. "152.734999")
+        # Then convert to Decimal
+        d = Decimal(str(x))
         
-        # Step 2: Round Half Up (Standard Excel/School method)
-        # Decimal('147.015') -> 147.02
-        val = float(Decimal(clean_str).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        # Round to 0.01 using ROUND_HALF_UP (Standard School/Excel Method)
+        # This ensures 152.734999 -> 152.73 (Correct)
+        # Whereas previously it might have bumped to 152.74 (Incorrect)
+        val = float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         return val
     except:
         return 0.0
@@ -94,7 +95,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (Strict Accounting Mode)
+# TAB 2: AI ANALYZER (Precision Mode)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -102,15 +103,14 @@ with tab2:
     uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
     
     if uploaded_excel:
-        st.info("Check the preview. Adjust 'Header Row Number' if the column names are wrong.")
+        st.info("Check the preview. Adjust 'Header Row Number' if needed.")
         header_row_idx = st.number_input("Header Row Number", min_value=0, max_value=20, value=0)
         
         # Load Data
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
-        
-        # ---> FIX: Apply Strict Rounding on Load <---
-        # We find numeric columns and force them to 2 decimals immediately.
-        # This prevents hidden decimals from ever entering the calculation.
+
+        # 1. APPLY PRECISION ROUNDING IMMEDIATELY
+        # This ensures the data in memory exactly matches what you see on paper
         numeric_cols = df_excel.select_dtypes(include=['float', 'float64']).columns
         for col in numeric_cols:
              df_excel[col] = df_excel[col].apply(strict_invoice_round)
@@ -138,19 +138,19 @@ with tab2:
                 for step in steps:
                     step_lower = step.lower()
                     
-                    # 1. Match Columns
+                    # Match Columns
                     col_map = {c.lower(): c for c in current_df.columns}
                     sorted_cols = sorted(col_map.keys(), key=len, reverse=True)
                     found_cols = [col_map[c] for c in sorted_cols if c in step_lower]
                     
-                    # 2. Identify Operation
+                    # Identify Op
                     op = None
                     if 'sort' in step_lower: op = 'sort'
                     elif any(x in step_lower for x in ['sum', 'total', 'add', 'subtotal']): op = 'sum'
                     elif any(x in step_lower for x in ['avg', 'average']): op = 'mean'
                     elif any(x in step_lower for x in ['count']): op = 'count'
                     
-                    # 3. EXECUTE LOGIC
+                    # EXECUTE
                     if op == 'sort' and found_cols:
                         target = found_cols[0]
                         ascending = False if 'desc' in step_lower else True
@@ -167,11 +167,8 @@ with tab2:
                             if group_candidates: group_col = group_candidates[0]
                         
                         if group_col:
-                            # --- PREPARE DATA FOR CALCULATION ---
-                            # Identify Value Columns
+                            # Identify Values
                             val_cols = [c for c in found_cols if c != group_col]
-                            
-                            # Determine Targets
                             if 'all' in step_lower or 'each' in step_lower or not val_cols:
                                 target_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
                                 if group_col in target_cols: target_cols.remove(group_col)
@@ -179,14 +176,15 @@ with tab2:
                                 target_cols = val_cols
 
                             if target_cols:
-                                # Clean & Round (Redundant safety check)
+                                # Ensure we are calculating on strictly rounded numbers
                                 for c in target_cols:
-                                    current_df[c] = pd.to_numeric(
+                                     # Clean string artifacts if any
+                                     current_df[c] = pd.to_numeric(
                                         current_df[c].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
                                         errors='coerce'
-                                    )
-                                    # Strict Rounding BEFORE Summing
-                                    current_df[c] = current_df[c].apply(strict_invoice_round)
+                                     )
+                                     # Force Rounding One Last Time Before Sum
+                                     current_df[c] = current_df[c].apply(strict_invoice_round)
 
                                 res = current_df.groupby(group_col)[target_cols].agg(op)
                                 res_df = res.reset_index()
@@ -199,10 +197,7 @@ with tab2:
                             # Simple Total
                             if found_cols:
                                 target = found_cols[0]
-                                current_df[target] = pd.to_numeric(
-                                    current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
-                                    errors='coerce'
-                                )
+                                current_df[target] = pd.to_numeric(current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
                                 current_df[target] = current_df[target].apply(strict_invoice_round)
                                 
                                 val = current_df[target].agg(op)
@@ -212,12 +207,12 @@ with tab2:
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
 
-            # 4. FINAL DISPLAY
+            # FINAL DISPLAY
             for msg in log_messages:
                 st.write(msg)
             
             if final_result is not None:
-                # Apply rounding to the FINAL result too, just in case
+                # Apply rounding to the final result (just to be safe)
                 res_numeric = final_result.select_dtypes(include=['float', 'float64']).columns
                 for c in res_numeric:
                     final_result[c] = final_result[c].apply(strict_invoice_round)
