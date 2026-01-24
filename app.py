@@ -3,203 +3,179 @@ import pandas as pd
 import pytesseract
 from pdf2image import convert_from_bytes
 import io
-import re
-from PIL import Image, ImageOps
+import numpy as np
 
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Smart Invoice to Excel", layout="wide")
-st.title("📄 Smart Invoice/Scan to Excel")
+st.set_page_config(page_title="Layout Preserving OCR", layout="wide")
+st.title("📄 Exact Layout Scan-to-Excel")
 
 # ------------------------------------------------------------------
-# HELPER: IMAGE PROCESSING
+# ALGORITHM: RECONSTRUCT TABLE FROM COORDINATES
 # ------------------------------------------------------------------
 
-def process_image_for_ocr(image):
+def process_image_to_grid(image):
     """
-    Makes the image black & white and 2x larger.
-    This helps OCR read small invoice numbers drastically better.
+    1. Runs OCR to get X,Y coordinates of every word.
+    2. Groups words into Rows (based on Y).
+    3. Groups words into Columns (based on X).
+    4. Returns a Pandas DataFrame matching the visual layout.
     """
-    # 1. Grayscale
-    image = ImageOps.grayscale(image)
-    # 2. Resize (Double resolution)
-    width, height = image.size
-    image = image.resize((width * 2, height * 2), Image.Resampling.LANCZOS)
-    return image
-
-def extract_text_from_pdf(file_bytes):
-    """ Converts PDF to Image -> Pre-process -> OCR """
-    try:
-        images = convert_from_bytes(file_bytes)
-    except Exception as e:
-        st.error(f"Error reading PDF: {e}")
-        return ""
-
-    full_text = ""
-    progress = st.progress(0)
+    # Get detailed data (words, left, top, width, height)
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     
-    for i, img in enumerate(images):
-        # Optimize image for tables
-        processed_img = process_image_for_ocr(img)
+    df_words = pd.DataFrame(data)
+    # Filter out empty text and low confidence noise
+    df_words = df_words[df_words['text'].str.strip() != '']
+    df_words['text'] = df_words['text'].astype(str)
+    
+    if df_words.empty:
+        return pd.DataFrame()
+
+    # --- STEP 1: DEFINE ROWS (Y-Axis) ---
+    # We round the 'top' coordinate to the nearest 10 pixels to group words on the same line
+    df_words['row_group'] = (df_words['top'] / 10).round().astype(int) * 10
+    
+    # Sort by vertical position (rows), then horizontal (reading order)
+    df_words = df_words.sort_values(by=['row_group', 'left'])
+
+    # --- STEP 2: DEFINE COLUMNS (X-Axis) ---
+    # We look at where words usually start to find "Column Lines"
+    # This is a simple binning strategy: Round 'left' to nearest 50 pixels
+    df_words['col_group'] = (df_words['left'] / 50).round().astype(int) * 50
+
+    # --- STEP 3: BUILD THE GRID ---
+    # We create a matrix using these groups
+    
+    # Get unique row and col coordinates
+    unique_rows = sorted(df_words['row_group'].unique())
+    unique_cols = sorted(df_words['col_group'].unique())
+    
+    # Create an empty DataFrame with these dimensions
+    grid_df = pd.DataFrame(index=unique_rows, columns=unique_cols)
+    
+    # Fill the grid
+    for _, row in df_words.iterrows():
+        r = row['row_group']
+        c = row['col_group']
+        txt = row['text']
         
-        # --psm 6: Assume a single uniform block of text
-        text = pytesseract.image_to_string(processed_img, config='--psm 6')
-        full_text += text + "\n"
-        progress.progress((i + 1) / len(images))
-        
-    progress.empty()
-    return full_text
-
-# ------------------------------------------------------------------
-# HELPER: PARSING LOGIC (THE FIX)
-# ------------------------------------------------------------------
-
-def parse_invoice_mode(text):
-    """
-    SMART MODE: Instead of splitting by space, we look for the Price 
-    at the end of the line and assume everything else is description.
-    """
-    lines = text.split('\n')
-    data = []
-
-    # Regex to find a price at the end of a line 
-    # Examples: "1,234.56" or "500.00" or "$123.45"
-    # It looks for: Numbers + optional comma + dot + 2 digits + End of String
-    price_pattern = re.compile(r'[\$]?([0-9,]+\.[0-9]{2})$')
-
-    for line in lines:
-        clean_line = line.strip()
-        if not clean_line:
-            continue
-            
-        # 1. Search for price at the end
-        match = price_pattern.search(clean_line)
-        
-        if match:
-            # We found a Price! 
-            price_str = match.group(1) # The number part
-            
-            # The description is everything BEFORE the price
-            # We remove the price from the line to get the rest
-            description_part = clean_line[:match.start()].strip()
-            
-            # Clean up the price (remove commas for math)
-            numeric_value = float(price_str.replace(',', ''))
-            
-            data.append({
-                "Full_Row_Text": description_part,  # Keep context
-                "Extracted_Value": numeric_value
-            })
+        # If cell is empty, add text. If not, append it (for multi-word cells)
+        if pd.isna(grid_df.at[r, c]):
+            grid_df.at[r, c] = txt
         else:
-            # If no price found, we add it as a "Text Only" row (header or notes)
-            # We skip short noise (like "4W" on its own if it has no price)
-            if len(clean_line) > 3:
-                data.append({
-                    "Full_Row_Text": clean_line,
-                    "Extracted_Value": 0.0
-                })
+            grid_df.at[r, c] = f"{grid_df.at[r, c]} {txt}"
 
-    return pd.DataFrame(data)
-
-def parse_simple_mode(text):
-    """ ORIGINAL MODE: Split by spaces (Good for simple lists) """
-    lines = text.split('\n')
-    data = []
-    for line in lines:
-        if line.strip():
-            row = re.split(r'\s{2,}', line.strip()) # Split by 2+ spaces
-            data.append(row)
+    # Reset index to look like a normal table
+    grid_df = grid_df.reset_index(drop=True)
+    grid_df.columns = [f"Col_{i+1}" for i in range(len(grid_df.columns))]
     
-    # Normalize
-    if data:
-        max_cols = max(len(r) for r in data)
-        data = [r + [''] * (max_cols - len(r)) for r in data]
-        return pd.DataFrame(data, columns=[f"Col_{i}" for i in range(max_cols)])
-    return pd.DataFrame()
+    return grid_df
 
 # ------------------------------------------------------------------
 # MAIN APP
 # ------------------------------------------------------------------
 
-if 'ocr_cache' not in st.session_state:
-    st.session_state.ocr_cache = ""
+if 'master_df' not in st.session_state:
+    st.session_state.master_df = None
 
-uploaded_file = st.file_uploader("Upload PDF Invoice/Scan", type=["pdf"])
+uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
 
 if uploaded_file:
-    # 1. RUN OCR (If new file)
-    if st.session_state.ocr_cache == "":
-        st.info("Scanning & Enhancing Image...")
-        file_bytes = uploaded_file.read()
-        st.session_state.ocr_cache = extract_text_from_pdf(file_bytes)
+    # 1. PROCESS PDF
+    if st.session_state.master_df is None:
+        with st.spinner("Analyzing layout and reconstructing grid..."):
+            try:
+                # Convert PDF to image (First page only for speed demo)
+                images = convert_from_bytes(uploaded_file.read())
+                
+                # Process the first page (loop this if you need multi-page)
+                df = process_image_to_grid(images[0])
+                st.session_state.master_df = df
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-    raw_text = st.session_state.ocr_cache
+    df = st.session_state.master_df
 
-    if raw_text:
-        st.divider()
+    if df is not None:
+        st.success("Layout Reconstructed!")
+
+        # -------------------------------------------------------
+        # TAB 1: PREVIEW & DOWNLOAD (Layout Focus)
+        # -------------------------------------------------------
+        st.subheader("1. Preview & Download Excel")
+        st.caption("This is the raw data matching your visual layout.")
         
-        # 2. CHOOSE MODE
-        st.subheader("1. Extraction Strategy")
-        mode = st.radio(
-            "Select how to read this file:",
-            ["Smart Invoice Mode (Best for your file)", "Simple Table Mode"],
-            horizontal=True
+        # Display editable grid
+        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+
+        # DOWNLOAD BUTTON
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            edited_df.to_excel(writer, index=False, header=False)
+        
+        st.download_button(
+            label="📥 Download Excel File (Original Layout)",
+            data=output.getvalue(),
+            file_name="scanned_layout.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+        st.divider()
+
+        # -------------------------------------------------------
+        # TAB 2: SORT & SUBTOTAL (Data Focus)
+        # -------------------------------------------------------
+        st.subheader("2. Sort and Calculate")
+        st.markdown("Now that you have the columns, you can perform your calculations here.")
+
+        c1, c2, c3 = st.columns(3)
         
-        st.caption("ℹ️ **Smart Mode** looks for a price at the end of every line (e.g. 3,780.89) and aligns the row automatically.")
+        with c1:
+            # Sorting
+            sort_col = st.selectbox("Sort by Column:", ["None"] + list(edited_df.columns))
+        
+        with c2:
+            # Grouping
+            group_col = st.selectbox("Group Subtotals by:", ["None"] + list(edited_df.columns))
+            
+        with c3:
+            # Summing
+            sum_col = st.selectbox("Sum Values in:", ["None"] + list(edited_df.columns))
 
-        # 3. PARSE DATA
-        if mode.startswith("Smart"):
-            df = parse_invoice_mode(raw_text)
-            
-            # Show the result immediately
-            st.subheader("2. Verify Data")
-            
-            # Allow user to edit
-            edited_df = st.data_editor(
-                df, 
-                num_rows="dynamic", 
-                use_container_width=True,
-                column_config={
-                    "Extracted_Value": st.column_config.NumberColumn(
-                        "Amount",
-                        format="$%.2f"
-                    ),
-                    "Full_Row_Text": st.column_config.TextColumn(
-                        "Description / Details",
-                        width="large"
-                    )
-                }
-            )
-            
-            # CALCULATE
-            st.divider()
-            st.subheader("3. Subtotals")
-            
-            # Since we already separated Description and Value, we just need to Group
-            # However, for Invoices, usually you just want the Grand Total or filter by Text
-            
-            total_sum = edited_df["Extracted_Value"].sum()
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(label="Grand Total", value=f"${total_sum:,.2f}")
-            
-            # Export
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                edited_df.to_excel(writer, sheet_name='Invoice Data', index=False)
-            
-            st.download_button("📥 Download Excel", output.getvalue(), "invoice_smart_export.xlsx")
+        # LOGIC
+        final_view = edited_df.copy()
 
-        else:
-            # Fallback to the old way if Smart Mode fails
-            df = parse_simple_mode(raw_text)
-            st.write("Raw Columns Detected:")
-            st.data_editor(df)
-            st.warning("Switch to 'Smart Invoice Mode' above for better results with prices.")
+        # Apply Sort
+        if sort_col != "None":
+            final_view = final_view.sort_values(by=sort_col)
 
-    if st.button("Reset / New File"):
-        st.session_state.ocr_cache = ""
+        # Apply Subtotal
+        if group_col != "None" and sum_col != "None":
+            try:
+                # Clean numbers first
+                final_view[sum_col] = (
+                    final_view[sum_col].astype(str)
+                    .str.replace(r'[^\d\.\-]', '', regex=True)
+                )
+                final_view[sum_col] = pd.to_numeric(final_view[sum_col], errors='coerce').fillna(0)
+
+                # Calculate GroupBy
+                subtotals = final_view.groupby(group_col)[sum_col].sum().reset_index()
+                subtotals.columns = [group_col, f"Total {sum_col}"]
+                
+                st.write("### Subtotal Results")
+                st.dataframe(subtotals, use_container_width=True)
+                
+            except Exception as e:
+                st.warning(f"Could not calculate: {e}. Make sure the 'Sum' column has numbers.")
+
+        elif sort_col != "None":
+            st.write("### Sorted Data")
+            st.dataframe(final_view, use_container_width=True)
+
+    # RESET
+    if st.button("Start Over / New File"):
+        st.session_state.master_df = None
         st.rerun()
