@@ -70,7 +70,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (With Rounding Fix)
+# TAB 2: AI ANALYZER (With Rounding on Load)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -82,8 +82,15 @@ with tab2:
         st.info("Check the preview below. If headers are wrong, change the 'Header Row Number'.")
         header_row_idx = st.number_input("Header Row Number (0 = First Row)", min_value=0, max_value=20, value=0)
         
+        # Load Data
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
         
+        # ---> FIX 1: ROUND ON LOAD <---
+        # Immediately find all number columns and round them to 2 places
+        # This fixes the "2796.62625" issue before you even calculate.
+        numeric_cols = df_excel.select_dtypes(include=['float', 'float64']).columns
+        df_excel[numeric_cols] = df_excel[numeric_cols].round(2)
+
         # Display Preview
         with st.expander("👀 View Data Preview", expanded=True):
             st.dataframe(df_excel.head())
@@ -133,9 +140,8 @@ with tab2:
                     elif op in ['sum', 'mean', 'count'] and found_cols:
                         val_col = found_cols[0] 
                         
-                        # Clean numbers
+                        # Clean numbers again just in case calculation introduces new decimals
                         clean_df = current_df.copy()
-                        # Force numeric conversion
                         clean_df[val_col] = pd.to_numeric(
                             clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
                             errors='coerce'
@@ -161,14 +167,14 @@ with tab2:
                             final_result = pd.DataFrame({f"{op.title()} of {val_col}": [val]})
                             log_messages.append(f"✅ Calculated total **{op}** of **{val_col}**")
                             
-                # 4. ROUNDING FIX AND DISPLAY
+                # 4. FINAL CLEANUP
                 for msg in log_messages:
                     st.write(msg)
                 
                 if final_result is not None:
-                    # ---> THE FIX: Round all numeric columns to 2 decimals <---
-                    numeric_cols = final_result.select_dtypes(include=['float', 'float64']).columns
-                    final_result[numeric_cols] = final_result[numeric_cols].round(2)
+                    # ---> FIX 2: ROUND RESULT <---
+                    res_numeric_cols = final_result.select_dtypes(include=['float', 'float64']).columns
+                    final_result[res_numeric_cols] = final_result[res_numeric_cols].round(2)
 
                     st.dataframe(final_result, use_container_width=True)
                     
