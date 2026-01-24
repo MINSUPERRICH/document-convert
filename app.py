@@ -16,31 +16,6 @@ st.title("🧠 Smart Scan & Analyze Tool")
 tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 
 # ------------------------------------------------------------------
-# HELPER: PRECISION ROUNDING (The Fix)
-# ------------------------------------------------------------------
-def strict_invoice_round(x):
-    """
-    Rounds a number to exactly 2 decimal places using standard arithmetic rounding.
-    Fixes 'Double Rounding' bugs by converting the raw value directly.
-    """
-    try:
-        # Check for empty or non-numeric
-        if pd.isna(x) or str(x).strip() == "":
-            return 0.0
-        
-        # Convert directly to string to preserve raw precision (e.g. "152.734999")
-        # Then convert to Decimal
-        d = Decimal(str(x))
-        
-        # Round to 0.01 using ROUND_HALF_UP (Standard School/Excel Method)
-        # This ensures 152.734999 -> 152.73 (Correct)
-        # Whereas previously it might have bumped to 152.74 (Incorrect)
-        val = float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        return val
-    except:
-        return 0.0
-
-# ------------------------------------------------------------------
 # TAB 1: SCAN PDF (OCR Logic)
 # ------------------------------------------------------------------
 with tab1:
@@ -95,7 +70,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (Precision Mode)
+# TAB 2: AI ANALYZER (Corrected "Raw Sum" Logic)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -106,17 +81,13 @@ with tab2:
         st.info("Check the preview. Adjust 'Header Row Number' if needed.")
         header_row_idx = st.number_input("Header Row Number", min_value=0, max_value=20, value=0)
         
-        # Load Data
+        # 1. LOAD RAW DATA (No rounding here)
+        # This keeps the "hidden decimals" (e.g. 147.015) intact so the sum is accurate.
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
 
-        # 1. APPLY PRECISION ROUNDING IMMEDIATELY
-        # This ensures the data in memory exactly matches what you see on paper
-        numeric_cols = df_excel.select_dtypes(include=['float', 'float64']).columns
-        for col in numeric_cols:
-             df_excel[col] = df_excel[col].apply(strict_invoice_round)
-
         with st.expander("👀 View Data Preview", expanded=True):
-            st.dataframe(df_excel.head())
+            # We round ONLY for the preview so it looks nice to you
+            st.dataframe(df_excel.head().round(2))
             st.caption(f"**Valid Column Names:** {', '.join(list(df_excel.columns))}")
 
         st.divider()
@@ -176,15 +147,13 @@ with tab2:
                                 target_cols = val_cols
 
                             if target_cols:
-                                # Ensure we are calculating on strictly rounded numbers
+                                # Ensure we calculate on numeric data
                                 for c in target_cols:
-                                     # Clean string artifacts if any
+                                     # Clean string artifacts ($,) but KEEP PRECISION
                                      current_df[c] = pd.to_numeric(
                                         current_df[c].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
                                         errors='coerce'
                                      )
-                                     # Force Rounding One Last Time Before Sum
-                                     current_df[c] = current_df[c].apply(strict_invoice_round)
 
                                 res = current_df.groupby(group_col)[target_cols].agg(op)
                                 res_df = res.reset_index()
@@ -198,7 +167,6 @@ with tab2:
                             if found_cols:
                                 target = found_cols[0]
                                 current_df[target] = pd.to_numeric(current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
-                                current_df[target] = current_df[target].apply(strict_invoice_round)
                                 
                                 val = current_df[target].agg(op)
                                 final_result = pd.DataFrame({f"{op.title()} of {target}": [val]})
@@ -212,16 +180,19 @@ with tab2:
                 st.write(msg)
             
             if final_result is not None:
-                # Apply rounding to the final result (just to be safe)
+                # 2. FINAL DISPLAY ROUNDING
+                # We calculate on raw numbers (for accuracy) but display cleanly.
                 res_numeric = final_result.select_dtypes(include=['float', 'float64']).columns
-                for c in res_numeric:
-                    final_result[c] = final_result[c].apply(strict_invoice_round)
+                
+                # Create a copy for display so we don't mess up the download file's logic if needed
+                display_df = final_result.copy()
+                display_df[res_numeric] = display_df[res_numeric].round(2)
 
-                st.dataframe(final_result, use_container_width=True)
+                st.dataframe(display_df, use_container_width=True)
                 
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine='openpyxl') as writer:
-                    final_result.to_excel(writer, index=False)
+                    display_df.to_excel(writer, index=False)
                 st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
             else:
                 st.warning("I processed the steps but couldn't generate a result.")
