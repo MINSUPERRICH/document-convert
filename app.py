@@ -12,109 +12,10 @@ import re
 st.set_page_config(page_title="AI Data Tool", layout="wide")
 st.title("🧠 Smart Scan & Analyze Tool")
 
-# Create two tabs
 tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 
 # ------------------------------------------------------------------
-# HELPER: SMART TEXT PARSER (The "Brain")
-# ------------------------------------------------------------------
-def parse_instruction_and_calculate(df, prompt):
-    """
-    Reads a text prompt and tries to execute pandas logic.
-    Supports: Sum, Average, Count, Sort, Group By.
-    """
-    prompt = prompt.lower()
-    
-    # 1. Identify Columns mentioned in the prompt
-    # We create a map of {lowercase_name: real_column_name}
-    col_map = {c.lower(): c for c in df.columns}
-    
-    # Find which columns the user typed
-    found_cols = [col_map[c] for c in col_map if c in prompt]
-    
-    # 2. Identify Operation
-    op = None
-    if any(x in prompt for x in ['sum', 'total', 'add', 'plus']): op = 'sum'
-    elif any(x in prompt for x in ['avg', 'average', 'mean']): op = 'mean'
-    elif any(x in prompt for x in ['count', 'number of', 'how many']): op = 'count'
-    elif 'sort' in prompt: op = 'sort'
-    
-    # 3. Execution Logic
-    try:
-        # CASE A: SORTING (e.g., "Sort by Date")
-        if op == 'sort':
-            if found_cols:
-                target_col = found_cols[0] # Pick the first column found
-                # Check for ascending/descending
-                ascending = False if 'desc' in prompt or 'high to low' in prompt else True
-                result = df.sort_values(by=target_col, ascending=ascending)
-                return result, f"✅ Sorted data by **{target_col}**"
-            else:
-                return None, "⚠️ I understood you want to sort, but I couldn't find the column name in your sentence."
-
-        # CASE B: GROUP BY CALCULATION (e.g. "Sum of Price by Color")
-        elif op in ['sum', 'mean', 'count']:
-            
-            # We need to find the Numeric Column (Value) and the Group Column (Category)
-            # If the user says "by [Column]", that is likely the grouper.
-            
-            if 'by' in prompt and len(found_cols) >= 2:
-                # Heuristic: split the sentence at 'by'. 
-                # Words before 'by' are likely the Value. Words after 'by' are likely the Group.
-                parts = prompt.split('by')
-                before_by = parts[0]
-                after_by = parts[1]
-                
-                # Find column mentioned before "by"
-                val_col = next((c for c in found_cols if c.lower() in before_by), None)
-                # Find column mentioned after "by"
-                group_col = next((c for c in found_cols if c.lower() in after_by), None)
-                
-                if val_col and group_col:
-                    # Clean the number column first
-                    clean_df = df.copy()
-                    # Remove '$', ',' and force to number
-                    clean_df[val_col] = pd.to_numeric(
-                        clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
-                        errors='coerce'
-                    ).fillna(0)
-
-                    # Perform GroupBy
-                    if op == 'sum': 
-                        res = clean_df.groupby(group_col)[val_col].sum()
-                    elif op == 'mean': 
-                        res = clean_df.groupby(group_col)[val_col].mean()
-                    elif op == 'count': 
-                        res = clean_df.groupby(group_col)[val_col].count()
-                    
-                    # Format Result
-                    res_df = res.reset_index()
-                    res_df.columns = [group_col, f"{op.title()} of {val_col}"]
-                    return res_df, f"✅ Calculated **{op}** of **{val_col}** grouped by **{group_col}**."
-            
-            # CASE C: SIMPLE TOTAL (e.g. "Total of Price")
-            elif len(found_cols) >= 1:
-                target_col = found_cols[0]
-                # Clean Data
-                clean_series = pd.to_numeric(
-                    df[target_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
-                    errors='coerce'
-                ).fillna(0)
-                
-                if op == 'sum': val = clean_series.sum()
-                elif op == 'mean': val = clean_series.mean()
-                elif op == 'count': val = clean_series.count()
-                
-                # Return as a tiny dataframe for consistency
-                return pd.DataFrame({f"{op.title()} of {target_col}": [val]}), f"✅ Calculated total **{op}** of **{target_col}**."
-
-    except Exception as e:
-        return None, f"❌ An error occurred while calculating: {e}"
-
-    return None, "❓ I didn't understand. Try phrasing it like: '**Sum** of **Amount** by **Category**' or '**Sort** by **Date**'."
-
-# ------------------------------------------------------------------
-# TAB 1: PDF SCANNER (Existing Code)
+# TAB 1: SCAN PDF (OCR Logic)
 # ------------------------------------------------------------------
 with tab1:
     st.header("1. Scan PDF to Excel")
@@ -137,6 +38,11 @@ with tab1:
                     found = True; break
             if not found: col_definitions.append(x)
         col_definitions.sort()
+        
+        # Safe column indexing
+        if not col_definitions:
+             return pd.DataFrame()
+
         df['col_idx'] = df['left'].apply(lambda x: np.argmin([abs(x - c) for c in col_definitions]))
         
         grid = [['' for _ in range(len(col_definitions))] for _ in range(len(df['row_id'].unique()))]
@@ -157,6 +63,7 @@ with tab1:
             sens = st.slider("Sensitivity", 5, 100, 25)
         try:
             images = convert_from_bytes(uploaded_pdf.read())
+            # Process first page
             st.session_state.scan_df = process_layout_preserving(images[0], sens)
             st.success("Scan Processed!")
             edited_scan = st.data_editor(st.session_state.scan_df, num_rows="dynamic", use_container_width=True)
@@ -166,52 +73,117 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (New Logic)
+# TAB 2: AI ANALYZER (Updated Logic)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
-    st.caption("Upload an Excel file and type instructions like: 'Sum of Amount by Category'")
     
     uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
     
     if uploaded_excel:
-        df_excel = pd.read_excel(uploaded_excel)
+        # 1. HEADER SELECTION (The Fix for your issue)
+        st.info("Does the data look weird? Change the 'Header Row' number below until the columns match your file.")
+        header_row_idx = st.number_input("Header Row Number (0 = First Row)", min_value=0, max_value=20, value=0)
         
-        # 1. SHOW DATA
-        with st.expander("👀 View Raw Data", expanded=True):
+        # Load with specific header
+        df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
+        
+        # Show Data
+        with st.expander("👀 View Data Preview", expanded=True):
             st.dataframe(df_excel.head())
-            st.markdown(f"**Available Columns:** {', '.join(df_excel.columns)}")
+            st.caption(f"Active Columns: {', '.join(list(df_excel.columns))}")
 
         st.divider()
 
-        # 2. THE CHAT INTERFACE
+        # 2. CHAT INTERFACE
         st.subheader("What do you want to calculate?")
-        
-        col_input, col_btn = st.columns([4, 1])
-        with col_input:
-            user_query = st.text_input("Type your direction here:", placeholder="e.g., Calculate total Price by Product")
-        with col_btn:
-            st.write("") # Spacer
-            st.write("") # Spacer
-            run_calc = st.button("🚀 Run", type="primary")
+        user_query = st.text_input("Direction:", placeholder="e.g. Sort by class, then sum of Amount")
+        run_calc = st.button("🚀 Run", type="primary")
 
-        # 3. PROCESS THE REQUEST
+        # 3. MULTI-STEP PARSER
         if run_calc and user_query:
-            result_df, message = parse_instruction_and_calculate(df_excel, user_query)
             
-            st.info(message) # Show what the app understood
+            # A. Split instructions (handle periods, 'then', 'after that')
+            steps = re.split(r'[.;]| then | after that | and ', user_query, flags=re.IGNORECASE)
+            steps = [s.strip() for s in steps if s.strip()]
             
-            if result_df is not None:
-                st.dataframe(result_df, use_container_width=True)
+            current_df = df_excel.copy()
+            final_result = None
+            log_messages = []
+            
+            try:
+                for step in steps:
+                    step_lower = step.lower()
+                    
+                    # FIND COLUMNS mentioned in this step
+                    col_map = {c.lower(): c for c in current_df.columns}
+                    # We look for long column names first to avoid partial matches
+                    sorted_cols = sorted(col_map.keys(), key=len, reverse=True)
+                    found_cols = [col_map[c] for c in sorted_cols if c in step_lower]
+                    
+                    # IDENTIFY OPERATION
+                    op = None
+                    if 'sort' in step_lower: op = 'sort'
+                    elif any(x in step_lower for x in ['sum', 'total', 'add']): op = 'sum'
+                    elif any(x in step_lower for x in ['avg', 'average']): op = 'mean'
+                    elif any(x in step_lower for x in ['count']): op = 'count'
+                    
+                    # EXECUTE LOGIC
+                    if op == 'sort' and found_cols:
+                        # SORTING (Updates the main dataframe for next steps)
+                        target = found_cols[0]
+                        ascending = False if 'desc' in step_lower else True
+                        current_df = current_df.sort_values(by=target, ascending=ascending)
+                        log_messages.append(f"✅ Sorted by **{target}**")
+                        final_result = current_df # Update result to show the sorted table
+
+                    elif op in ['sum', 'mean', 'count'] and found_cols:
+                        # CALCULATION (Produces a result)
+                        val_col = found_cols[0] # Assume first found col is the value
+                        
+                        # Clean numbers
+                        clean_df = current_df.copy()
+                        clean_df[val_col] = pd.to_numeric(
+                            clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
+                            errors='coerce'
+                        ).fillna(0)
+
+                        if 'by' in step_lower and len(found_cols) > 1:
+                            # GROUP BY Logic
+                            # If prompt is "Sum of Amount by Class", we found Amount and Class.
+                            # We assume the one AFTER 'by' is the grouper.
+                            parts = step_lower.split('by')
+                            group_candidates = [c for c in found_cols if c.lower() in parts[1]]
+                            
+                            if group_candidates:
+                                group_col = group_candidates[0]
+                                val_col = [c for c in found_cols if c != group_col][0]
+                                
+                                res = clean_df.groupby(group_col)[val_col].agg(op)
+                                res_df = res.reset_index()
+                                res_df.columns = [group_col, f"{op.title()} of {val_col}"]
+                                final_result = res_df
+                                log_messages.append(f"✅ Calculated **{op}** of **{val_col}** by **{group_col}**")
+                        else:
+                            # SIMPLE AGGREGATION
+                            val = clean_df[val_col].agg(op)
+                            final_result = pd.DataFrame({f"{op.title()} of {val_col}": [val]})
+                            log_messages.append(f"✅ Calculated total **{op}** of **{val_col}**")
+                            
+                # 4. DISPLAY RESULTS
+                for msg in log_messages:
+                    st.write(msg)
                 
-                # Download Result
-                out_buff = io.BytesIO()
-                with pd.ExcelWriter(out_buff, engine='openpyxl') as writer:
-                    result_df.to_excel(writer, index=False)
-                
-                st.download_button(
-                    label="📥 Download Result",
-                    data=out_buff.getvalue(),
-                    file_name="calculation_result.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                if final_result is not None:
+                    st.dataframe(final_result, use_container_width=True)
+                    
+                    # Download
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                        final_result.to_excel(writer, index=False)
+                    st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
+                else:
+                    st.warning("I processed the steps but couldn't generate a result. Did you mention the correct column names?")
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
