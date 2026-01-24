@@ -5,7 +5,6 @@ from pdf2image import convert_from_bytes
 import io
 import numpy as np
 import re
-from decimal import Decimal, ROUND_HALF_UP
 
 # ------------------------------------------------------------------
 # CONFIGURATION
