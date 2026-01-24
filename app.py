@@ -16,29 +16,28 @@ st.title("🧠 Smart Scan & Analyze Tool")
 tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 
 # ------------------------------------------------------------------
-# HELPER: EXCEL-STYLE ROUNDING
+# HELPER: STRICT "INVOICE STYLE" ROUNDING
 # ------------------------------------------------------------------
-def excel_round(x):
+def strict_invoice_round(x):
     """
-    Forces standard rounding (Round Half Up) to match Excel.
-    Python's default .round() rounds to nearest even number (Banker's Rounding).
+    Simulates a human typing numbers from a paper invoice.
+    1. Cleans hidden float artifacts (e.g. 1.00499999 -> 1.005)
+    2. Rounds to exactly 2 decimal places UP (Standard Rounding)
     """
     try:
-        if pd.isna(x) or x == "":
+        if pd.isna(x) or str(x).strip() == "":
             return 0.0
-        # Convert to Decimal, round to 2 places using ROUND_HALF_UP
-        return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        
+        # Step 1: Format to string to remove binary float noise
+        # This ensures 147.015000001 is treated as "147.01500"
+        clean_str = "{:.6f}".format(float(x))
+        
+        # Step 2: Round Half Up (Standard Excel/School method)
+        # Decimal('147.015') -> 147.02
+        val = float(Decimal(clean_str).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        return val
     except:
-        return x
-
-def apply_excel_rounding(df, cols=None):
-    """Applies the rounding to all numeric columns in the dataframe"""
-    if cols is None:
-        cols = df.select_dtypes(include=['float', 'float64']).columns
-    
-    for c in cols:
-        df[c] = df[c].apply(excel_round)
-    return df
+        return 0.0
 
 # ------------------------------------------------------------------
 # TAB 1: SCAN PDF (OCR Logic)
@@ -95,7 +94,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (Updated with Excel Rounding)
+# TAB 2: AI ANALYZER (Strict Accounting Mode)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -103,14 +102,18 @@ with tab2:
     uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
     
     if uploaded_excel:
-        st.info("If your columns look wrong (e.g. Unnamed: 0), increase the Header Row Number.")
+        st.info("Check the preview. Adjust 'Header Row Number' if the column names are wrong.")
         header_row_idx = st.number_input("Header Row Number", min_value=0, max_value=20, value=0)
         
         # Load Data
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
         
-        # ---> FIX: Apply Excel-Style Rounding Immediately <---
-        df_excel = apply_excel_rounding(df_excel)
+        # ---> FIX: Apply Strict Rounding on Load <---
+        # We find numeric columns and force them to 2 decimals immediately.
+        # This prevents hidden decimals from ever entering the calculation.
+        numeric_cols = df_excel.select_dtypes(include=['float', 'float64']).columns
+        for col in numeric_cols:
+             df_excel[col] = df_excel[col].apply(strict_invoice_round)
 
         with st.expander("👀 View Data Preview", expanded=True):
             st.dataframe(df_excel.head())
@@ -156,35 +159,35 @@ with tab2:
                         final_result = current_df 
 
                     elif op in ['sum', 'mean', 'count']:
-                        # Identify Group Column
+                        
                         group_col = None
                         if 'by' in step_lower:
                             parts = step_lower.split('by')
                             group_candidates = [c for c in found_cols if c.lower() in parts[1]]
-                            if group_candidates:
-                                group_col = group_candidates[0]
+                            if group_candidates: group_col = group_candidates[0]
                         
                         if group_col:
-                            # Clean/Prepare Data
-                            for c in current_df.columns:
-                                if c != group_col:
-                                    # Force conversion to number, remove currency symbols
-                                    current_df[c] = pd.to_numeric(
-                                        current_df[c].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-                                        errors='coerce'
-                                    )
-                                    # APPLY ROUNDING AGAIN to be safe
-                                    current_df[c] = current_df[c].apply(excel_round)
-
-                            # Identify Target Columns
+                            # --- PREPARE DATA FOR CALCULATION ---
+                            # Identify Value Columns
                             val_cols = [c for c in found_cols if c != group_col]
+                            
+                            # Determine Targets
                             if 'all' in step_lower or 'each' in step_lower or not val_cols:
                                 target_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
                                 if group_col in target_cols: target_cols.remove(group_col)
                             else:
                                 target_cols = val_cols
-                            
+
                             if target_cols:
+                                # Clean & Round (Redundant safety check)
+                                for c in target_cols:
+                                    current_df[c] = pd.to_numeric(
+                                        current_df[c].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
+                                        errors='coerce'
+                                    )
+                                    # Strict Rounding BEFORE Summing
+                                    current_df[c] = current_df[c].apply(strict_invoice_round)
+
                                 res = current_df.groupby(group_col)[target_cols].agg(op)
                                 res_df = res.reset_index()
                                 res_df.columns = [group_col] + [f"{op.title()} of {c}" for c in target_cols]
@@ -196,7 +199,12 @@ with tab2:
                             # Simple Total
                             if found_cols:
                                 target = found_cols[0]
-                                current_df[target] = pd.to_numeric(current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), errors='coerce')
+                                current_df[target] = pd.to_numeric(
+                                    current_df[target].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
+                                    errors='coerce'
+                                )
+                                current_df[target] = current_df[target].apply(strict_invoice_round)
+                                
                                 val = current_df[target].agg(op)
                                 final_result = pd.DataFrame({f"{op.title()} of {target}": [val]})
                                 log_messages.append(f"✅ Calculated total **{op}** of **{target}**")
@@ -209,9 +217,11 @@ with tab2:
                 st.write(msg)
             
             if final_result is not None:
-                # ---> Apply Final Rounding <---
-                final_result = apply_excel_rounding(final_result)
-                
+                # Apply rounding to the FINAL result too, just in case
+                res_numeric = final_result.select_dtypes(include=['float', 'float64']).columns
+                for c in res_numeric:
+                    final_result[c] = final_result[c].apply(strict_invoice_round)
+
                 st.dataframe(final_result, use_container_width=True)
                 
                 out = io.BytesIO()
@@ -219,4 +229,4 @@ with tab2:
                     final_result.to_excel(writer, index=False)
                 st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
             else:
-                st.warning("I processed the steps but couldn't generate a result. Check your spelling.")
+                st.warning("I processed the steps but couldn't generate a result.")
