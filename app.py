@@ -4,210 +4,214 @@ import pytesseract
 from pdf2image import convert_from_bytes
 import io
 import numpy as np
+import re
 
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Pixel-Perfect Invoice Scanner", layout="wide")
-st.title("📄 Pixel-Perfect Invoice to Excel")
+st.set_page_config(page_title="AI Data Tool", layout="wide")
+st.title("🧠 Smart Scan & Analyze Tool")
+
+# Create two tabs
+tab1, tab2 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel with AI"])
 
 # ------------------------------------------------------------------
-# ALGORITHM: VISUAL COLUMN CLUSTERING
+# HELPER: SMART TEXT PARSER (The "Brain")
 # ------------------------------------------------------------------
-
-def process_layout_preserving(image, clustering_sensitivity=15):
+def parse_instruction_and_calculate(df, prompt):
     """
-    1. Detects words and their X (horizontal) positions.
-    2. Clusters similar X-positions to define 'Global Columns'.
-    3. Maps every row's words into these Global Columns.
+    Reads a text prompt and tries to execute pandas logic.
+    Supports: Sum, Average, Count, Sort, Group By.
     """
-    # 1. Get detailed OCR data
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    df = pd.DataFrame(data)
+    prompt = prompt.lower()
     
-    # Filter noise
-    df = df[df['text'].str.strip() != '']
-    df['text'] = df['text'].astype(str)
+    # 1. Identify Columns mentioned in the prompt
+    # We create a map of {lowercase_name: real_column_name}
+    col_map = {c.lower(): c for c in df.columns}
     
-    if df.empty:
-        return pd.DataFrame()
-
-    # 2. Define Rows (Y-Axis)
-    # Round Y-coordinates to group words on the same line
-    df['row_id'] = (df['top'] / 15).round().astype(int) 
-
-    # 3. Define Global Columns (The Core Logic)
-    # We look at the 'left' coordinate of EVERY word in the document.
-    # Words that start at similar X positions (e.g., 500px, 502px, 498px) belong to the same column.
+    # Find which columns the user typed
+    found_cols = [col_map[c] for c in col_map if c in prompt]
     
-    # We use a simple clustering approach:
-    all_lefts = df['left'].sort_values().unique()
+    # 2. Identify Operation
+    op = None
+    if any(x in prompt for x in ['sum', 'total', 'add', 'plus']): op = 'sum'
+    elif any(x in prompt for x in ['avg', 'average', 'mean']): op = 'mean'
+    elif any(x in prompt for x in ['count', 'number of', 'how many']): op = 'count'
+    elif 'sort' in prompt: op = 'sort'
     
-    col_definitions = [] # List of representative X-values
-    
-    for x in all_lefts:
-        # Check if this x belongs to an existing cluster
-        found_cluster = False
-        for i, center in enumerate(col_definitions):
-            if abs(x - center) < clustering_sensitivity: # Sensitivity threshold (pixels)
-                # Update cluster center (weighted average could be better, but simple average works)
-                col_definitions[i] = (center + x) / 2
-                found_cluster = True
-                break
-        
-        if not found_cluster:
-            col_definitions.append(x)
-            
-    col_definitions.sort()
-    
-    # Map every word to a column index (0, 1, 2...)
-    def get_col_index(x_val):
-        # Find closest column center
-        distances = [abs(x_val - c) for c in col_definitions]
-        return np.argmin(distances)
-
-    df['col_idx'] = df['left'].apply(get_col_index)
-
-    # 4. Build the Grid
-    # Create empty grid: Rows x Columns
-    unique_rows = sorted(df['row_id'].unique())
-    num_cols = len(col_definitions)
-    
-    grid = [['' for _ in range(num_cols)] for _ in range(len(unique_rows))]
-    
-    # Map row_ids to list indices 0..N
-    row_map = {rid: i for i, rid in enumerate(unique_rows)}
-
-    for _, row in df.iterrows():
-        r_idx = row_map[row['row_id']]
-        c_idx = row['col_idx']
-        txt = row['text']
-        
-        # Append text if cell already has content (merging split words)
-        if grid[r_idx][c_idx]:
-            grid[r_idx][c_idx] += " " + txt
-        else:
-            grid[r_idx][c_idx] = txt
-
-    # Convert to DataFrame
-    final_df = pd.DataFrame(grid)
-    
-    # Clean up: Drop columns that are completely empty
-    final_df = final_df.loc[:, (final_df != '').any(axis=0)]
-    
-    # Name columns generically
-    final_df.columns = [f"Col_{i+1}" for i in range(final_df.shape[1])]
-    
-    return final_df
-
-# ------------------------------------------------------------------
-# MAIN APP
-# ------------------------------------------------------------------
-
-if 'scan_df' not in st.session_state:
-    st.session_state.scan_df = None
-
-uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
-
-if uploaded_file:
-    # PREVIEW SETTINGS
-    with st.expander("⚙️ Alignment Settings (Open if columns are messy)", expanded=False):
-        sensitivity = st.slider(
-            "Column Sensitivity (Lower = More Columns, Higher = Merged Columns)", 
-            min_value=5, 
-            max_value=100, 
-            value=25,
-            help="If columns are splitting too much (e.g. '$' separate from '100'), increase this number."
-        )
-        
-    # PROCESS
-    # We re-run this only if file changes or button pressed, 
-    # but for slider responsiveness we run it on change.
+    # 3. Execution Logic
     try:
-        images = convert_from_bytes(uploaded_file.read())
-        # Processing First Page Only for Speed
-        df = process_layout_preserving(images[0], clustering_sensitivity=sensitivity)
-        st.session_state.scan_df = df
+        # CASE A: SORTING (e.g., "Sort by Date")
+        if op == 'sort':
+            if found_cols:
+                target_col = found_cols[0] # Pick the first column found
+                # Check for ascending/descending
+                ascending = False if 'desc' in prompt or 'high to low' in prompt else True
+                result = df.sort_values(by=target_col, ascending=ascending)
+                return result, f"✅ Sorted data by **{target_col}**"
+            else:
+                return None, "⚠️ I understood you want to sort, but I couldn't find the column name in your sentence."
+
+        # CASE B: GROUP BY CALCULATION (e.g. "Sum of Price by Color")
+        elif op in ['sum', 'mean', 'count']:
+            
+            # We need to find the Numeric Column (Value) and the Group Column (Category)
+            # If the user says "by [Column]", that is likely the grouper.
+            
+            if 'by' in prompt and len(found_cols) >= 2:
+                # Heuristic: split the sentence at 'by'. 
+                # Words before 'by' are likely the Value. Words after 'by' are likely the Group.
+                parts = prompt.split('by')
+                before_by = parts[0]
+                after_by = parts[1]
+                
+                # Find column mentioned before "by"
+                val_col = next((c for c in found_cols if c.lower() in before_by), None)
+                # Find column mentioned after "by"
+                group_col = next((c for c in found_cols if c.lower() in after_by), None)
+                
+                if val_col and group_col:
+                    # Clean the number column first
+                    clean_df = df.copy()
+                    # Remove '$', ',' and force to number
+                    clean_df[val_col] = pd.to_numeric(
+                        clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
+                        errors='coerce'
+                    ).fillna(0)
+
+                    # Perform GroupBy
+                    if op == 'sum': 
+                        res = clean_df.groupby(group_col)[val_col].sum()
+                    elif op == 'mean': 
+                        res = clean_df.groupby(group_col)[val_col].mean()
+                    elif op == 'count': 
+                        res = clean_df.groupby(group_col)[val_col].count()
+                    
+                    # Format Result
+                    res_df = res.reset_index()
+                    res_df.columns = [group_col, f"{op.title()} of {val_col}"]
+                    return res_df, f"✅ Calculated **{op}** of **{val_col}** grouped by **{group_col}**."
+            
+            # CASE C: SIMPLE TOTAL (e.g. "Total of Price")
+            elif len(found_cols) >= 1:
+                target_col = found_cols[0]
+                # Clean Data
+                clean_series = pd.to_numeric(
+                    df[target_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True), 
+                    errors='coerce'
+                ).fillna(0)
+                
+                if op == 'sum': val = clean_series.sum()
+                elif op == 'mean': val = clean_series.mean()
+                elif op == 'count': val = clean_series.count()
+                
+                # Return as a tiny dataframe for consistency
+                return pd.DataFrame({f"{op.title()} of {target_col}": [val]}), f"✅ Calculated total **{op}** of **{target_col}**."
+
     except Exception as e:
-        st.error(f"Processing Error: {e}")
+        return None, f"❌ An error occurred while calculating: {e}"
 
-    df = st.session_state.scan_df
+    return None, "❓ I didn't understand. Try phrasing it like: '**Sum** of **Amount** by **Category**' or '**Sort** by **Date**'."
 
-    if df is not None:
-        st.success("Structure Reconstructed!")
-
-        # -------------------------------------------------------
-        # SECTION 1: CLEANUP & DOWNLOAD
-        # -------------------------------------------------------
-        st.subheader("1. Verify & Download")
-        st.caption("Check the 'TOTAL' row at the bottom. It should now align with the Price column.")
+# ------------------------------------------------------------------
+# TAB 1: PDF SCANNER (Existing Code)
+# ------------------------------------------------------------------
+with tab1:
+    st.header("1. Scan PDF to Excel")
+    
+    # --- HELPER: PIXEL ALIGNMENT ALGORITHM ---
+    def process_layout_preserving(image, clustering_sensitivity=15):
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        df = pd.DataFrame(data)
+        df = df[df['text'].str.strip() != '']
+        if df.empty: return pd.DataFrame()
         
-        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-
-        # DOWNLOAD
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            edited_df.to_excel(writer, index=False, header=False)
+        df['row_id'] = (df['top'] / 15).round().astype(int) 
+        all_lefts = df['left'].sort_values().unique()
+        col_definitions = [] 
+        for x in all_lefts:
+            found = False
+            for i, c in enumerate(col_definitions):
+                if abs(x - c) < clustering_sensitivity:
+                    col_definitions[i] = (c + x) / 2
+                    found = True; break
+            if not found: col_definitions.append(x)
+        col_definitions.sort()
+        df['col_idx'] = df['left'].apply(lambda x: np.argmin([abs(x - c) for c in col_definitions]))
         
-        col_dl, col_dummy = st.columns([1, 3])
-        with col_dl:
-            st.download_button(
-                label="📥 Download Excel File",
-                data=output.getvalue(),
-                file_name="aligned_scan.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        grid = [['' for _ in range(len(col_definitions))] for _ in range(len(df['row_id'].unique()))]
+        row_map = {rid: i for i, rid in enumerate(sorted(df['row_id'].unique()))}
+        for _, row in df.iterrows():
+            grid[row_map[row['row_id']]][row['col_idx']] = (grid[row_map[row['row_id']]][row['col_idx']] + " " + row['text']).strip()
+            
+        final = pd.DataFrame(grid)
+        final = final.loc[:, (final != '').any(axis=0)]
+        final.columns = [f"Col_{i+1}" for i in range(final.shape[1])]
+        return final
+
+    if 'scan_df' not in st.session_state: st.session_state.scan_df = None
+    uploaded_pdf = st.file_uploader("Upload Scanned PDF", type=["pdf"], key="pdf1")
+    
+    if uploaded_pdf:
+        with st.expander("Alignment Settings"):
+            sens = st.slider("Sensitivity", 5, 100, 25)
+        try:
+            images = convert_from_bytes(uploaded_pdf.read())
+            st.session_state.scan_df = process_layout_preserving(images[0], sens)
+            st.success("Scan Processed!")
+            edited_scan = st.data_editor(st.session_state.scan_df, num_rows="dynamic", use_container_width=True)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer: edited_scan.to_excel(writer, index=False, header=False)
+            st.download_button("📥 Download Excel", output.getvalue(), "scan.xlsx")
+        except Exception as e: st.error(f"Error: {e}")
+
+# ------------------------------------------------------------------
+# TAB 2: AI ANALYZER (New Logic)
+# ------------------------------------------------------------------
+with tab2:
+    st.header("2. Ask the App to Calculate")
+    st.caption("Upload an Excel file and type instructions like: 'Sum of Amount by Category'")
+    
+    uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
+    
+    if uploaded_excel:
+        df_excel = pd.read_excel(uploaded_excel)
+        
+        # 1. SHOW DATA
+        with st.expander("👀 View Raw Data", expanded=True):
+            st.dataframe(df_excel.head())
+            st.markdown(f"**Available Columns:** {', '.join(df_excel.columns)}")
 
         st.divider()
 
-        # -------------------------------------------------------
-        # SECTION 2: SORT & SUBTOTAL
-        # -------------------------------------------------------
-        st.subheader("2. Sort & Subtotal")
+        # 2. THE CHAT INTERFACE
+        st.subheader("What do you want to calculate?")
         
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            sort_col = st.selectbox("Sort by:", ["None"] + list(edited_df.columns))
-        with c2:
-            group_col = st.selectbox("Group by:", ["None"] + list(edited_df.columns))
-        with c3:
-            sum_col = st.selectbox("Sum values in:", ["None"] + list(edited_df.columns))
+        col_input, col_btn = st.columns([4, 1])
+        with col_input:
+            user_query = st.text_input("Type your direction here:", placeholder="e.g., Calculate total Price by Product")
+        with col_btn:
+            st.write("") # Spacer
+            st.write("") # Spacer
+            run_calc = st.button("🚀 Run", type="primary")
 
-        # LOGIC
-        calc_df = edited_df.copy()
-
-        # 1. Clean Data (Remove 'Total' row so it doesn't mess up sorting)
-        # We assume any row containing "TOTAL" in the first few columns is a footer
-        mask = calc_df.astype(str).apply(lambda x: x.str.contains('TOTAL', case=False, na=False)).any(axis=1)
-        data_rows = calc_df[~mask]  # Rows WITHOUT 'Total'
-        footer_rows = calc_df[mask] # Rows WITH 'Total'
-
-        # 2. Sorting
-        if sort_col != "None":
-            data_rows = data_rows.sort_values(by=sort_col)
-            st.info(f"Data sorted by {sort_col}")
-
-        # 3. Calculation
-        if group_col != "None" and sum_col != "None":
-            try:
-                # Clean numbers: remove '$', ',', spaces
-                clean_vals = data_rows[sum_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True)
-                data_rows['numeric_val'] = pd.to_numeric(clean_vals, errors='coerce').fillna(0)
+        # 3. PROCESS THE REQUEST
+        if run_calc and user_query:
+            result_df, message = parse_instruction_and_calculate(df_excel, user_query)
+            
+            st.info(message) # Show what the app understood
+            
+            if result_df is not None:
+                st.dataframe(result_df, use_container_width=True)
                 
-                # Group
-                summary = data_rows.groupby(group_col)['numeric_val'].sum().reset_index()
-                summary.columns = [group_col, f"Total {sum_col}"]
+                # Download Result
+                out_buff = io.BytesIO()
+                with pd.ExcelWriter(out_buff, engine='openpyxl') as writer:
+                    result_df.to_excel(writer, index=False)
                 
-                st.write("### Subtotal Results")
-                st.dataframe(summary, use_container_width=True)
-                
-            except Exception as e:
-                st.error(f"Calculation failed: {e}")
-        else:
-            # If no calc, just show sorted list
-            st.write("### Working Data")
-            st.dataframe(data_rows, use_container_width=True)
-
-    if st.button("Reset"):
-        st.session_state.scan_df = None
-        st.rerun()
+                st.download_button(
+                    label="📥 Download Result",
+                    data=out_buff.getvalue(),
+                    file_name="calculation_result.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
