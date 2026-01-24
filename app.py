@@ -8,174 +8,206 @@ import numpy as np
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Layout Preserving OCR", layout="wide")
-st.title("📄 Exact Layout Scan-to-Excel")
+st.set_page_config(page_title="Pixel-Perfect Invoice Scanner", layout="wide")
+st.title("📄 Pixel-Perfect Invoice to Excel")
 
 # ------------------------------------------------------------------
-# ALGORITHM: RECONSTRUCT TABLE FROM COORDINATES
+# ALGORITHM: VISUAL COLUMN CLUSTERING
 # ------------------------------------------------------------------
 
-def process_image_to_grid(image):
+def process_layout_preserving(image, clustering_sensitivity=15):
     """
-    1. Runs OCR to get X,Y coordinates of every word.
-    2. Groups words into Rows (based on Y).
-    3. Groups words into Columns (based on X).
-    4. Returns a Pandas DataFrame matching the visual layout.
+    1. Detects words and their X (horizontal) positions.
+    2. Clusters similar X-positions to define 'Global Columns'.
+    3. Maps every row's words into these Global Columns.
     """
-    # Get detailed data (words, left, top, width, height)
+    # 1. Get detailed OCR data
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    df = pd.DataFrame(data)
     
-    df_words = pd.DataFrame(data)
-    # Filter out empty text and low confidence noise
-    df_words = df_words[df_words['text'].str.strip() != '']
-    df_words['text'] = df_words['text'].astype(str)
+    # Filter noise
+    df = df[df['text'].str.strip() != '']
+    df['text'] = df['text'].astype(str)
     
-    if df_words.empty:
+    if df.empty:
         return pd.DataFrame()
 
-    # --- STEP 1: DEFINE ROWS (Y-Axis) ---
-    # We round the 'top' coordinate to the nearest 10 pixels to group words on the same line
-    df_words['row_group'] = (df_words['top'] / 10).round().astype(int) * 10
-    
-    # Sort by vertical position (rows), then horizontal (reading order)
-    df_words = df_words.sort_values(by=['row_group', 'left'])
+    # 2. Define Rows (Y-Axis)
+    # Round Y-coordinates to group words on the same line
+    df['row_id'] = (df['top'] / 15).round().astype(int) 
 
-    # --- STEP 2: DEFINE COLUMNS (X-Axis) ---
-    # We look at where words usually start to find "Column Lines"
-    # This is a simple binning strategy: Round 'left' to nearest 50 pixels
-    df_words['col_group'] = (df_words['left'] / 50).round().astype(int) * 50
+    # 3. Define Global Columns (The Core Logic)
+    # We look at the 'left' coordinate of EVERY word in the document.
+    # Words that start at similar X positions (e.g., 500px, 502px, 498px) belong to the same column.
+    
+    # We use a simple clustering approach:
+    all_lefts = df['left'].sort_values().unique()
+    
+    col_definitions = [] # List of representative X-values
+    
+    for x in all_lefts:
+        # Check if this x belongs to an existing cluster
+        found_cluster = False
+        for i, center in enumerate(col_definitions):
+            if abs(x - center) < clustering_sensitivity: # Sensitivity threshold (pixels)
+                # Update cluster center (weighted average could be better, but simple average works)
+                col_definitions[i] = (center + x) / 2
+                found_cluster = True
+                break
+        
+        if not found_cluster:
+            col_definitions.append(x)
+            
+    col_definitions.sort()
+    
+    # Map every word to a column index (0, 1, 2...)
+    def get_col_index(x_val):
+        # Find closest column center
+        distances = [abs(x_val - c) for c in col_definitions]
+        return np.argmin(distances)
 
-    # --- STEP 3: BUILD THE GRID ---
-    # We create a matrix using these groups
+    df['col_idx'] = df['left'].apply(get_col_index)
+
+    # 4. Build the Grid
+    # Create empty grid: Rows x Columns
+    unique_rows = sorted(df['row_id'].unique())
+    num_cols = len(col_definitions)
     
-    # Get unique row and col coordinates
-    unique_rows = sorted(df_words['row_group'].unique())
-    unique_cols = sorted(df_words['col_group'].unique())
+    grid = [['' for _ in range(num_cols)] for _ in range(len(unique_rows))]
     
-    # Create an empty DataFrame with these dimensions
-    grid_df = pd.DataFrame(index=unique_rows, columns=unique_cols)
-    
-    # Fill the grid
-    for _, row in df_words.iterrows():
-        r = row['row_group']
-        c = row['col_group']
+    # Map row_ids to list indices 0..N
+    row_map = {rid: i for i, rid in enumerate(unique_rows)}
+
+    for _, row in df.iterrows():
+        r_idx = row_map[row['row_id']]
+        c_idx = row['col_idx']
         txt = row['text']
         
-        # If cell is empty, add text. If not, append it (for multi-word cells)
-        if pd.isna(grid_df.at[r, c]):
-            grid_df.at[r, c] = txt
+        # Append text if cell already has content (merging split words)
+        if grid[r_idx][c_idx]:
+            grid[r_idx][c_idx] += " " + txt
         else:
-            grid_df.at[r, c] = f"{grid_df.at[r, c]} {txt}"
+            grid[r_idx][c_idx] = txt
 
-    # Reset index to look like a normal table
-    grid_df = grid_df.reset_index(drop=True)
-    grid_df.columns = [f"Col_{i+1}" for i in range(len(grid_df.columns))]
+    # Convert to DataFrame
+    final_df = pd.DataFrame(grid)
     
-    return grid_df
+    # Clean up: Drop columns that are completely empty
+    final_df = final_df.loc[:, (final_df != '').any(axis=0)]
+    
+    # Name columns generically
+    final_df.columns = [f"Col_{i+1}" for i in range(final_df.shape[1])]
+    
+    return final_df
 
 # ------------------------------------------------------------------
 # MAIN APP
 # ------------------------------------------------------------------
 
-if 'master_df' not in st.session_state:
-    st.session_state.master_df = None
+if 'scan_df' not in st.session_state:
+    st.session_state.scan_df = None
 
 uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
 
 if uploaded_file:
-    # 1. PROCESS PDF
-    if st.session_state.master_df is None:
-        with st.spinner("Analyzing layout and reconstructing grid..."):
-            try:
-                # Convert PDF to image (First page only for speed demo)
-                images = convert_from_bytes(uploaded_file.read())
-                
-                # Process the first page (loop this if you need multi-page)
-                df = process_image_to_grid(images[0])
-                st.session_state.master_df = df
-            except Exception as e:
-                st.error(f"Error: {e}")
+    # PREVIEW SETTINGS
+    with st.expander("⚙️ Alignment Settings (Open if columns are messy)", expanded=False):
+        sensitivity = st.slider(
+            "Column Sensitivity (Lower = More Columns, Higher = Merged Columns)", 
+            min_value=5, 
+            max_value=100, 
+            value=25,
+            help="If columns are splitting too much (e.g. '$' separate from '100'), increase this number."
+        )
+        
+    # PROCESS
+    # We re-run this only if file changes or button pressed, 
+    # but for slider responsiveness we run it on change.
+    try:
+        images = convert_from_bytes(uploaded_file.read())
+        # Processing First Page Only for Speed
+        df = process_layout_preserving(images[0], clustering_sensitivity=sensitivity)
+        st.session_state.scan_df = df
+    except Exception as e:
+        st.error(f"Processing Error: {e}")
 
-    df = st.session_state.master_df
+    df = st.session_state.scan_df
 
     if df is not None:
-        st.success("Layout Reconstructed!")
+        st.success("Structure Reconstructed!")
 
         # -------------------------------------------------------
-        # TAB 1: PREVIEW & DOWNLOAD (Layout Focus)
+        # SECTION 1: CLEANUP & DOWNLOAD
         # -------------------------------------------------------
-        st.subheader("1. Preview & Download Excel")
-        st.caption("This is the raw data matching your visual layout.")
+        st.subheader("1. Verify & Download")
+        st.caption("Check the 'TOTAL' row at the bottom. It should now align with the Price column.")
         
-        # Display editable grid
         edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-        # DOWNLOAD BUTTON
+        # DOWNLOAD
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             edited_df.to_excel(writer, index=False, header=False)
         
-        st.download_button(
-            label="📥 Download Excel File (Original Layout)",
-            data=output.getvalue(),
-            file_name="scanned_layout.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        col_dl, col_dummy = st.columns([1, 3])
+        with col_dl:
+            st.download_button(
+                label="📥 Download Excel File",
+                data=output.getvalue(),
+                file_name="aligned_scan.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         st.divider()
 
         # -------------------------------------------------------
-        # TAB 2: SORT & SUBTOTAL (Data Focus)
+        # SECTION 2: SORT & SUBTOTAL
         # -------------------------------------------------------
-        st.subheader("2. Sort and Calculate")
-        st.markdown("Now that you have the columns, you can perform your calculations here.")
-
+        st.subheader("2. Sort & Subtotal")
+        
         c1, c2, c3 = st.columns(3)
-        
         with c1:
-            # Sorting
-            sort_col = st.selectbox("Sort by Column:", ["None"] + list(edited_df.columns))
-        
+            sort_col = st.selectbox("Sort by:", ["None"] + list(edited_df.columns))
         with c2:
-            # Grouping
-            group_col = st.selectbox("Group Subtotals by:", ["None"] + list(edited_df.columns))
-            
+            group_col = st.selectbox("Group by:", ["None"] + list(edited_df.columns))
         with c3:
-            # Summing
-            sum_col = st.selectbox("Sum Values in:", ["None"] + list(edited_df.columns))
+            sum_col = st.selectbox("Sum values in:", ["None"] + list(edited_df.columns))
 
         # LOGIC
-        final_view = edited_df.copy()
+        calc_df = edited_df.copy()
 
-        # Apply Sort
+        # 1. Clean Data (Remove 'Total' row so it doesn't mess up sorting)
+        # We assume any row containing "TOTAL" in the first few columns is a footer
+        mask = calc_df.astype(str).apply(lambda x: x.str.contains('TOTAL', case=False, na=False)).any(axis=1)
+        data_rows = calc_df[~mask]  # Rows WITHOUT 'Total'
+        footer_rows = calc_df[mask] # Rows WITH 'Total'
+
+        # 2. Sorting
         if sort_col != "None":
-            final_view = final_view.sort_values(by=sort_col)
+            data_rows = data_rows.sort_values(by=sort_col)
+            st.info(f"Data sorted by {sort_col}")
 
-        # Apply Subtotal
+        # 3. Calculation
         if group_col != "None" and sum_col != "None":
             try:
-                # Clean numbers first
-                final_view[sum_col] = (
-                    final_view[sum_col].astype(str)
-                    .str.replace(r'[^\d\.\-]', '', regex=True)
-                )
-                final_view[sum_col] = pd.to_numeric(final_view[sum_col], errors='coerce').fillna(0)
-
-                # Calculate GroupBy
-                subtotals = final_view.groupby(group_col)[sum_col].sum().reset_index()
-                subtotals.columns = [group_col, f"Total {sum_col}"]
+                # Clean numbers: remove '$', ',', spaces
+                clean_vals = data_rows[sum_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True)
+                data_rows['numeric_val'] = pd.to_numeric(clean_vals, errors='coerce').fillna(0)
+                
+                # Group
+                summary = data_rows.groupby(group_col)['numeric_val'].sum().reset_index()
+                summary.columns = [group_col, f"Total {sum_col}"]
                 
                 st.write("### Subtotal Results")
-                st.dataframe(subtotals, use_container_width=True)
+                st.dataframe(summary, use_container_width=True)
                 
             except Exception as e:
-                st.warning(f"Could not calculate: {e}. Make sure the 'Sum' column has numbers.")
+                st.error(f"Calculation failed: {e}")
+        else:
+            # If no calc, just show sorted list
+            st.write("### Working Data")
+            st.dataframe(data_rows, use_container_width=True)
 
-        elif sort_col != "None":
-            st.write("### Sorted Data")
-            st.dataframe(final_view, use_container_width=True)
-
-    # RESET
-    if st.button("Start Over / New File"):
-        st.session_state.master_df = None
+    if st.button("Reset"):
+        st.session_state.scan_df = None
         st.rerun()
