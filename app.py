@@ -27,7 +27,7 @@ def process_scan_to_text(file_bytes):
     progress_bar = st.progress(0)
     
     for i, image in enumerate(images):
-        # psm 6 = Assume a single uniform block of text
+        # We use standard psm 6 to get raw lines
         text = pytesseract.image_to_string(image, config='--psm 6')
         full_text += text + "\n"
         progress_bar.progress((i + 1) / len(images))
@@ -35,143 +35,124 @@ def process_scan_to_text(file_bytes):
     progress_bar.empty()
     return full_text
 
-def text_to_dataframe(text, split_strategy="2+ Spaces"):
+def raw_text_to_initial_df(text):
     """
-    Parses raw text into DataFrame based on user selected strategy.
+    Just dumps text into a single column DataFrame initially.
+    We will let pandas split it later.
     """
     lines = text.split('\n')
-    data = []
-    
-    # Define the regex pattern based on user choice
-    if split_strategy == "2+ Spaces":
-        pattern = r'\s{2,}'  # Standard for tables
-    elif split_strategy == "1+ Space":
-        pattern = r'\s+'     # Aggressive splitting
-    else:
-        pattern = r'\t+'     # Tab separated
-    
-    for line in lines:
-        if line.strip():
-            # Remove leading/trailing whitespace before splitting
-            clean_line = line.strip()
-            row = re.split(pattern, clean_line)
-            data.append(row)
-
-    if not data:
-        return None
-
-    # Normalize row lengths (pad missing columns with empty strings)
-    max_cols = max(len(row) for row in data)
-    normalized_data = [row + [''] * (max_cols - len(row)) for row in data]
-    
-    # Create generic headers (Column 1, Column 2...) to avoid weird "4W" names
-    headers = [f"Col_{i+1}" for i in range(max_cols)]
-    
-    # We use the first row as data, not header, because OCR often messes up headers.
-    # The user can rename them in the editor.
-    df = pd.DataFrame(normalized_data, columns=headers)
-    return df
+    # Filter out empty lines
+    lines = [line.strip() for line in lines if line.strip()]
+    return pd.DataFrame(lines, columns=["Raw_Text"])
 
 # ------------------------------------------------------------------
 # MAIN APP LOGIC
 # ------------------------------------------------------------------
 
+if 'df_main' not in st.session_state:
+    st.session_state.df_main = None
+
 uploaded_file = st.file_uploader("Upload Scanned PDF", type=["pdf"])
 
-# STORE DATA IN SESSION STATE SO IT DOESN'T RESET WHEN YOU CHANGE SETTINGS
-if 'ocr_text' not in st.session_state:
-    st.session_state.ocr_text = ""
-
 if uploaded_file is not None:
-    # Only run OCR if it's a new file
-    if st.session_state.ocr_text == "":
-        st.info("Reading scanned image... this may take a moment.")
-        file_bytes = uploaded_file.read()
-        st.session_state.ocr_text = process_scan_to_text(file_bytes)
-
-    raw_text = st.session_state.ocr_text
     
-    if raw_text:
-        # -------------------------------------------------------
-        # SECTION 1: TEXT PARSING SETTINGS
-        # -------------------------------------------------------
-        with st.expander("⚙️ Parsing Settings (Click here if columns are messy)", expanded=True):
-            split_choice = st.radio(
-                "How should we split the columns?",
-                ["2+ Spaces", "1+ Space"],
-                index=0,
-                horizontal=True,
-                help="If your data is stuck in one column, try '1+ Space'."
-            )
-        
-        # Parse text into DataFrame
-        df = text_to_dataframe(raw_text, split_strategy=split_choice)
-        
-        if df is not None:
-            st.success("Scan processed!")
+    # 1. READ FILE (Only once)
+    if st.session_state.df_main is None:
+        with st.spinner("Scanning document..."):
+            file_bytes = uploaded_file.read()
+            raw_text = process_scan_to_text(file_bytes)
+            st.session_state.df_main = raw_text_to_initial_df(raw_text)
 
-            # -------------------------------------------------------
-            # SECTION 2: CONFIGURE COLUMNS
-            # -------------------------------------------------------
-            st.subheader("1. Configure Columns")
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                cat_col = st.selectbox("Category Column (Group By):", ["Select..."] + list(df.columns))
-            with c2:
-                val_col = st.selectbox("Value Column (to Sum):", ["Select..."] + list(df.columns))
-
-            # -------------------------------------------------------
-            # SECTION 3: VERIFY & EDIT
-            # -------------------------------------------------------
-            st.subheader("2. Verify Data")
-            st.caption("Rename columns by double-clicking the headers below.")
-            
-            # Simple editor - let user fix data before calc
-            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-
-            # -------------------------------------------------------
-            # SECTION 4: RESULTS
-            # -------------------------------------------------------
-            st.divider()
-            
-            if cat_col != "Select..." and val_col != "Select...":
-                if cat_col == val_col:
-                    st.warning("⚠️ You selected the same column for both Category and Value. Please select different columns.")
-                else:
-                    try:
-                        # 1. Clean the numbers
-                        # Remove ' . ' or other OCR noise from numbers
-                        edited_df[val_col] = (
-                            edited_df[val_col]
-                            .astype(str)
-                            .str.replace(r'[^\d\.\-]', '', regex=True) # Keep only digits, dots, and minus
-                        )
-                        edited_df[val_col] = pd.to_numeric(edited_df[val_col], errors='coerce').fillna(0)
-
-                        # 2. Calculate safely
-                        # We explicitly name the series to avoid the "already exists" crash
-                        subtotal_series = edited_df.groupby(cat_col)[val_col].sum()
-                        subtotal_series.name = "Total Amount" 
-                        
-                        result_df = subtotal_series.reset_index()
-
-                        # 3. Show Result
-                        st.subheader("3. Calculation Results")
-                        st.dataframe(result_df, use_container_width=True)
-                        
-                        # 4. Download
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            edited_df.to_excel(writer, sheet_name='Clean Data', index=False)
-                            result_df.to_excel(writer, sheet_name='Subtotals', index=False)
-                            
-                        st.download_button("📥 Download Excel", output.getvalue(), "scan_results.xlsx")
-
-                    except Exception as e:
-                        st.error(f"Calculation Error: {e}")
+    df = st.session_state.df_main.copy()
     
-    # Reset button to clear cache for new file
-    if st.button("Clear & Upload New File"):
-        st.session_state.ocr_text = ""
-        st.rerun()
+    if not df.empty:
+        st.divider()
+
+        # -------------------------------------------------------
+        # SECTION 1: DATA CLEANUP (THE FIX)
+        # -------------------------------------------------------
+        st.subheader("1. Clean Up Structure")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.markdown("""
+            **Does your data look stuck in one column?** Click the button below to force-split the text by spaces.
+            """)
+            
+            # THE MAGIC BUTTON: Splits "Col_1" into "0, 1, 2, 3..."
+            if st.button("✂️ Split Text into Columns"):
+                # Split by whitespace
+                df_split = df.iloc[:, 0].str.split(expand=True)
+                
+                # Update the main dataframe in session state
+                st.session_state.df_main = df_split
+                st.rerun()
+
+            if st.button("↺ Reset to Original"):
+                st.session_state.df_main = None
+                st.rerun()
+
+        # Display the current state of the data
+        st.write("Current Data Preview:")
+        st.dataframe(df.head(5), use_container_width=True)
+
+        # -------------------------------------------------------
+        # SECTION 2: DEFINE COLUMNS
+        # -------------------------------------------------------
+        st.divider()
+        st.subheader("2. Select Columns")
+        
+        # Get list of current column names (0, 1, 2, 3...)
+        cols = list(df.columns)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            cat_col = st.selectbox("Category Column (Group By):", ["Select..."] + cols)
+        with c2:
+            val_col = st.selectbox("Value Column (to Sum):", ["Select..."] + cols)
+
+        # -------------------------------------------------------
+        # SECTION 3: EDIT & CALCULATE
+        # -------------------------------------------------------
+        st.divider()
+        st.subheader("3. Verify & Download")
+        
+        # Allow editing
+        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+
+        if cat_col != "Select..." and val_col != "Select...":
+            if cat_col == val_col:
+                st.warning("Please pick different columns for Category and Value.")
+            else:
+                try:
+                    # CLEANUP LOGIC:
+                    # 1. Convert Value column to numeric (force errors to NaN)
+                    # Remove '$', ',', and spaces
+                    clean_vals = edited_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True)
+                    edited_df[f"Clean_{val_col}"] = pd.to_numeric(clean_vals, errors='coerce').fillna(0)
+
+                    # 2. Group By
+                    summary_df = edited_df.groupby(cat_col)[f"Clean_{val_col}"].sum().reset_index()
+                    
+                    # 3. Rename for display
+                    summary_df.columns = ["Category", "Total Amount"]
+
+                    st.success("Calculation Successful!")
+                    st.dataframe(summary_df, use_container_width=True)
+
+                    # 4. Download
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        edited_df.to_excel(writer, sheet_name='Raw Data', index=False)
+                        summary_df.to_excel(writer, sheet_name='Subtotals', index=False)
+
+                    st.download_button(
+                        label="📥 Download Excel Result",
+                        data=output.getvalue(),
+                        file_name="converted_scan.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+                except Exception as e:
+                    st.error(f"Could not calculate: {e}")
