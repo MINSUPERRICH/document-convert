@@ -39,9 +39,7 @@ with tab1:
             if not found: col_definitions.append(x)
         col_definitions.sort()
         
-        # Safe column indexing
-        if not col_definitions:
-             return pd.DataFrame()
+        if not col_definitions: return pd.DataFrame()
 
         df['col_idx'] = df['left'].apply(lambda x: np.argmin([abs(x - c) for c in col_definitions]))
         
@@ -63,7 +61,6 @@ with tab1:
             sens = st.slider("Sensitivity", 5, 100, 25)
         try:
             images = convert_from_bytes(uploaded_pdf.read())
-            # Process first page
             st.session_state.scan_df = process_layout_preserving(images[0], sens)
             st.success("Scan Processed!")
             edited_scan = st.data_editor(st.session_state.scan_df, num_rows="dynamic", use_container_width=True)
@@ -73,7 +70,7 @@ with tab1:
         except Exception as e: st.error(f"Error: {e}")
 
 # ------------------------------------------------------------------
-# TAB 2: AI ANALYZER (Updated Logic)
+# TAB 2: AI ANALYZER (With Rounding Fix)
 # ------------------------------------------------------------------
 with tab2:
     st.header("2. Ask the App to Calculate")
@@ -81,14 +78,13 @@ with tab2:
     uploaded_excel = st.file_uploader("Upload Excel File", type=["xlsx", "xls"], key="xls1")
     
     if uploaded_excel:
-        # 1. HEADER SELECTION (The Fix for your issue)
-        st.info("Does the data look weird? Change the 'Header Row' number below until the columns match your file.")
+        # 1. HEADER SELECTION
+        st.info("Check the preview below. If headers are wrong, change the 'Header Row Number'.")
         header_row_idx = st.number_input("Header Row Number (0 = First Row)", min_value=0, max_value=20, value=0)
         
-        # Load with specific header
         df_excel = pd.read_excel(uploaded_excel, header=header_row_idx)
         
-        # Show Data
+        # Display Preview
         with st.expander("👀 View Data Preview", expanded=True):
             st.dataframe(df_excel.head())
             st.caption(f"Active Columns: {', '.join(list(df_excel.columns))}")
@@ -103,7 +99,6 @@ with tab2:
         # 3. MULTI-STEP PARSER
         if run_calc and user_query:
             
-            # A. Split instructions (handle periods, 'then', 'after that')
             steps = re.split(r'[.;]| then | after that | and ', user_query, flags=re.IGNORECASE)
             steps = [s.strip() for s in steps if s.strip()]
             
@@ -115,43 +110,39 @@ with tab2:
                 for step in steps:
                     step_lower = step.lower()
                     
-                    # FIND COLUMNS mentioned in this step
+                    # Match Columns
                     col_map = {c.lower(): c for c in current_df.columns}
-                    # We look for long column names first to avoid partial matches
                     sorted_cols = sorted(col_map.keys(), key=len, reverse=True)
                     found_cols = [col_map[c] for c in sorted_cols if c in step_lower]
                     
-                    # IDENTIFY OPERATION
+                    # Identify Op
                     op = None
                     if 'sort' in step_lower: op = 'sort'
                     elif any(x in step_lower for x in ['sum', 'total', 'add']): op = 'sum'
                     elif any(x in step_lower for x in ['avg', 'average']): op = 'mean'
                     elif any(x in step_lower for x in ['count']): op = 'count'
                     
-                    # EXECUTE LOGIC
+                    # Execution
                     if op == 'sort' and found_cols:
-                        # SORTING (Updates the main dataframe for next steps)
                         target = found_cols[0]
                         ascending = False if 'desc' in step_lower else True
                         current_df = current_df.sort_values(by=target, ascending=ascending)
                         log_messages.append(f"✅ Sorted by **{target}**")
-                        final_result = current_df # Update result to show the sorted table
+                        final_result = current_df 
 
                     elif op in ['sum', 'mean', 'count'] and found_cols:
-                        # CALCULATION (Produces a result)
-                        val_col = found_cols[0] # Assume first found col is the value
+                        val_col = found_cols[0] 
                         
                         # Clean numbers
                         clean_df = current_df.copy()
+                        # Force numeric conversion
                         clean_df[val_col] = pd.to_numeric(
                             clean_df[val_col].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
                             errors='coerce'
                         ).fillna(0)
 
                         if 'by' in step_lower and len(found_cols) > 1:
-                            # GROUP BY Logic
-                            # If prompt is "Sum of Amount by Class", we found Amount and Class.
-                            # We assume the one AFTER 'by' is the grouper.
+                            # Group By
                             parts = step_lower.split('by')
                             group_candidates = [c for c in found_cols if c.lower() in parts[1]]
                             
@@ -165,25 +156,28 @@ with tab2:
                                 final_result = res_df
                                 log_messages.append(f"✅ Calculated **{op}** of **{val_col}** by **{group_col}**")
                         else:
-                            # SIMPLE AGGREGATION
+                            # Simple Total
                             val = clean_df[val_col].agg(op)
                             final_result = pd.DataFrame({f"{op.title()} of {val_col}": [val]})
                             log_messages.append(f"✅ Calculated total **{op}** of **{val_col}**")
                             
-                # 4. DISPLAY RESULTS
+                # 4. ROUNDING FIX AND DISPLAY
                 for msg in log_messages:
                     st.write(msg)
                 
                 if final_result is not None:
+                    # ---> THE FIX: Round all numeric columns to 2 decimals <---
+                    numeric_cols = final_result.select_dtypes(include=['float', 'float64']).columns
+                    final_result[numeric_cols] = final_result[numeric_cols].round(2)
+
                     st.dataframe(final_result, use_container_width=True)
                     
-                    # Download
                     out = io.BytesIO()
                     with pd.ExcelWriter(out, engine='openpyxl') as writer:
                         final_result.to_excel(writer, index=False)
                     st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
                 else:
-                    st.warning("I processed the steps but couldn't generate a result. Did you mention the correct column names?")
+                    st.warning("I processed the steps but couldn't generate a result. Please check column names.")
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
