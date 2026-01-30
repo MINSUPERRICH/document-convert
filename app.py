@@ -10,10 +10,59 @@ import google.generativeai as genai
 from docx import Document
 
 # ------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION & SECURITY
 # ------------------------------------------------------------------
-st.set_page_config(page_title="AI Data Tool", layout="wide")
-st.title("🧠 Smart Scan & Analyze Tool")
+st.set_page_config(page_title="Secure AI Data Tool", layout="wide")
+
+# --- SECURITY: PASSWORD PROTECTION ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+
+    # 1. Look for password in secrets
+    if "app_password" not in st.secrets:
+        st.error("❌ No password set in secrets.toml! Please configure it.")
+        return False
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["password"] == st.secrets["app_password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't keep password in memory
+        else:
+            st.session_state["password_correct"] = False
+
+    # 2. Check session state (is user already logged in?)
+    if "password_correct" not in st.session_state:
+        # First run, show input
+        st.text_input(
+            "🔒 Please enter the App Password to access:", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        return False
+    elif not st.session_state["password_correct"]:
+        # Password incorrect, ask again
+        st.text_input(
+            "🔒 Please enter the App Password to access:", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        st.error("😕 Password incorrect")
+        return False
+    else:
+        # Password correct
+        return True
+
+# STOP THE APP IF NOT LOGGED IN
+if not check_password():
+    st.stop()
+
+# ------------------------------------------------------------------
+# MAIN APP (Only runs if password is correct)
+# ------------------------------------------------------------------
+st.title("🧠 Secure Smart Scan & Analyze Tool")
 
 # Create 3 Tabs
 tab1, tab2, tab3 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel", "📝 Generate Reports (Docs)"])
@@ -22,7 +71,6 @@ tab1, tab2, tab3 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel", "�
 # SHARED HELPER FUNCTIONS
 # ------------------------------------------------------------------
 def strict_invoice_round(x):
-    """Rounds to exactly 2 decimal places (Standard Rounding)"""
     try:
         if pd.isna(x) or str(x).strip() == "": return 0.0
         d = Decimal(str(x))
@@ -30,7 +78,6 @@ def strict_invoice_round(x):
     except: return 0.0
 
 def process_layout_preserving(image, clustering_sensitivity=15):
-    """Core OCR Logic for Tables"""
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     df = pd.DataFrame(data)
     df = df[df['text'].str.strip() != '']
@@ -171,22 +218,24 @@ with tab2:
                 st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
 
 # ------------------------------------------------------------------
-# TAB 3: GENERATE REPORTS (DOCS)
+# TAB 3: GENERATE REPORTS (SECURE AI)
 # ------------------------------------------------------------------
 with tab3:
     st.header("3. Generate Word/Google Docs")
-    st.markdown("Use this tab to create **Formal Reports** or **Clean Tables** from your PDF using AI.")
+    st.markdown("This feature uses your **Securely Stored** API Key.")
     
-    # API KEY INPUT
-    with st.expander("🔑 Setup AI (Required for Summary)", expanded=True):
-        api_key = st.text_input("Enter Google Gemini API Key:", type="password", help="Get a free key from Google AI Studio")
-        st.caption("Don't have a key? [Get one here](https://aistudio.google.com/app/apikey) (It's free).")
+    # SECURITY CHECK
+    if "GEMINI_API_KEY" in st.secrets:
+        st.success("✅ Secure API Key found in secrets.")
+        api_key = st.secrets["GEMINI_API_KEY"]
+    else:
+        st.error("❌ No API Key found in secrets.toml! Please add 'GEMINI_API_KEY'.")
+        st.stop()
 
     uploaded_doc_pdf = st.file_uploader("Upload PDF for Report", type=["pdf"], key="pdf_docs")
     
     if uploaded_doc_pdf:
         # 1. READ TEXT (Basic OCR)
-        # We use a simpler OCR extraction here because we want continuous text for the AI, not just a grid
         images = convert_from_bytes(uploaded_doc_pdf.read())
         raw_text = ""
         for img in images:
@@ -219,50 +268,47 @@ with tab3:
         
         # 3. GENERATE
         if st.button("✨ Generate Document"):
-            if not api_key:
-                st.warning("⚠️ Please enter a Google Gemini API Key at the top to use this feature.")
-            else:
-                try:
-                    with st.spinner("AI is reading and writing your report..."):
-                        # Configure Gemini
-                        genai.configure(api_key=api_key)
-                        model = genai.GenerativeModel('gemini-1.5-flash')
-                        
-                        # Send Request
-                        full_prompt = f"{user_prompt}\n\nHere is the document text:\n{raw_text}"
-                        response = model.generate_content(full_prompt)
-                        generated_text = response.text
-                        
-                        st.subheader("Generated Result")
-                        st.markdown(generated_text)
-                        
-                        # 4. EXPORT TO WORD
-                        doc = Document()
-                        doc.add_heading('Generated Report', 0)
-                        
-                        # Simple markdown-to-word parser
-                        for line in generated_text.split('\n'):
-                            clean_line = line.strip()
-                            if clean_line.startswith('## '):
-                                doc.add_heading(clean_line.replace('## ', ''), level=2)
-                            elif clean_line.startswith('# '):
-                                doc.add_heading(clean_line.replace('# ', ''), level=1)
-                            elif clean_line.startswith('* ') or clean_line.startswith('- '):
-                                doc.add_paragraph(clean_line.replace('* ', '').replace('- ', ''), style='List Bullet')
-                            else:
-                                if clean_line: doc.add_paragraph(clean_line)
+            try:
+                with st.spinner("AI is reading and writing your report..."):
+                    # Configure Gemini using SECURE KEY
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    
+                    # Send Request
+                    full_prompt = f"{user_prompt}\n\nHere is the document text:\n{raw_text}"
+                    response = model.generate_content(full_prompt)
+                    generated_text = response.text
+                    
+                    st.subheader("Generated Result")
+                    st.markdown(generated_text)
+                    
+                    # 4. EXPORT TO WORD
+                    doc = Document()
+                    doc.add_heading('Generated Report', 0)
+                    
+                    # Simple markdown-to-word parser
+                    for line in generated_text.split('\n'):
+                        clean_line = line.strip()
+                        if clean_line.startswith('## '):
+                            doc.add_heading(clean_line.replace('## ', ''), level=2)
+                        elif clean_line.startswith('# '):
+                            doc.add_heading(clean_line.replace('# ', ''), level=1)
+                        elif clean_line.startswith('* ') or clean_line.startswith('- '):
+                            doc.add_paragraph(clean_line.replace('* ', '').replace('- ', ''), style='List Bullet')
+                        else:
+                            if clean_line: doc.add_paragraph(clean_line)
 
-                        # Save to buffer
-                        doc_io = io.BytesIO()
-                        doc.save(doc_io)
-                        doc_io.seek(0)
-                        
-                        st.download_button(
-                            label="📥 Download as Word Doc (.docx)",
-                            data=doc_io,
-                            file_name="generated_report.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-                        
-                except Exception as e:
-                    st.error(f"AI Error: {e}. Check your API Key.")
+                    # Save to buffer
+                    doc_io = io.BytesIO()
+                    doc.save(doc_io)
+                    doc_io.seek(0)
+                    
+                    st.download_button(
+                        label="📥 Download as Word Doc (.docx)",
+                        data=doc_io,
+                        file_name="generated_report.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                    
+            except Exception as e:
+                st.error(f"AI Error: {e}. Check your API Key permissions.")
