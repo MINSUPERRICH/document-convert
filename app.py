@@ -17,60 +17,41 @@ st.set_page_config(page_title="Secure AI Data Tool", layout="wide")
 # --- SECURITY: PASSWORD PROTECTION ---
 def check_password():
     """Returns `True` if the user had the correct password."""
-
-    # 1. Look for password in secrets
     if "app_password" not in st.secrets:
         st.error("❌ No password set in secrets.toml! Please configure it.")
         return False
 
     def password_entered():
-        """Checks whether a password entered by the user is correct."""
         if st.session_state["password"] == st.secrets["app_password"]:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't keep password in memory
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
-    # 2. Check session state (is user already logged in?)
     if "password_correct" not in st.session_state:
-        # First run, show input
-        st.text_input(
-            "🔒 Please enter the App Password to access:", 
-            type="password", 
-            on_change=password_entered, 
-            key="password"
-        )
+        st.text_input("🔒 App Password:", type="password", on_change=password_entered, key="password")
         return False
     elif not st.session_state["password_correct"]:
-        # Password incorrect, ask again
-        st.text_input(
-            "🔒 Please enter the App Password to access:", 
-            type="password", 
-            on_change=password_entered, 
-            key="password"
-        )
+        st.text_input("🔒 App Password:", type="password", on_change=password_entered, key="password")
         st.error("😕 Password incorrect")
         return False
     else:
-        # Password correct
         return True
 
-# STOP THE APP IF NOT LOGGED IN
 if not check_password():
     st.stop()
 
 # ------------------------------------------------------------------
-# MAIN APP (Only runs if password is correct)
+# MAIN APP
 # ------------------------------------------------------------------
 st.title("🧠 Secure Smart Scan & Analyze Tool")
-
-# Create 3 Tabs
 tab1, tab2, tab3 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel", "📝 Generate Reports (Docs)"])
 
 # ------------------------------------------------------------------
-# SHARED HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ------------------------------------------------------------------
 def strict_invoice_round(x):
+    """Rounds to exactly 2 decimal places (Standard Rounding)"""
     try:
         if pd.isna(x) or str(x).strip() == "": return 0.0
         d = Decimal(str(x))
@@ -78,6 +59,7 @@ def strict_invoice_round(x):
     except: return 0.0
 
 def process_layout_preserving(image, clustering_sensitivity=15):
+    """Core OCR Logic for Tables"""
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     df = pd.DataFrame(data)
     df = df[df['text'].str.strip() != '']
@@ -218,97 +200,84 @@ with tab2:
                 st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
 
 # ------------------------------------------------------------------
-# TAB 3: GENERATE REPORTS (SECURE AI)
+# TAB 3: GENERATE REPORTS (AUTO-DETECT MODEL)
 # ------------------------------------------------------------------
 with tab3:
     st.header("3. Generate Word/Google Docs")
-    st.markdown("This feature uses your **Securely Stored** API Key.")
+    st.markdown("This uses the API Key stored in your `secrets.toml`.")
     
-    # SECURITY CHECK
     if "GEMINI_API_KEY" in st.secrets:
-        st.success("✅ Secure API Key found in secrets.")
         api_key = st.secrets["GEMINI_API_KEY"]
+        genai.configure(api_key=api_key)
     else:
-        st.error("❌ No API Key found in secrets.toml! Please add 'GEMINI_API_KEY'.")
+        st.error("❌ No API Key found in secrets.toml.")
         st.stop()
 
     uploaded_doc_pdf = st.file_uploader("Upload PDF for Report", type=["pdf"], key="pdf_docs")
     
     if uploaded_doc_pdf:
-        # 1. READ TEXT (Basic OCR)
         images = convert_from_bytes(uploaded_doc_pdf.read())
         raw_text = ""
         for img in images:
             raw_text += pytesseract.image_to_string(img) + "\n"
+        st.success("PDF Loaded!")
+        
+        # --- MODEL SELECTOR ---
+        st.subheader("AI Model Selection")
+        
+        # 1. Try to fetch available models dynamically from the user's key
+        try:
+            available_models = [
+                m.name for m in genai.list_models() 
+                if 'generateContent' in m.supported_generation_methods
+            ]
+            # Clean up names (remove 'models/')
+            clean_models = [m.replace('models/', '') for m in available_models]
             
-        st.success("PDF Loaded successfully!")
+            # Prioritize Gemini 2.5, then 2.0, then 1.5
+            # We sort them to show the newest first
+            clean_models.sort(reverse=True)
+            
+        except Exception as e:
+            # Fallback if list_models fails
+            clean_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
         
-        # 2. CHOOSE TEMPLATE
-        st.subheader("Choose a Document Style")
-        template_choice = st.radio(
-            "What do you want to create?", 
-            ["Option 1: Data Extraction (Best for Excel)", "Option 2: Research Summary (Best for Word)"]
-        )
+        # 2. Let user pick (Default to first in list, which should be newest)
+        col_model, col_style = st.columns(2)
+        with col_model:
+            selected_model = st.selectbox("Select AI Model:", clean_models, index=0)
         
-        # PREPARE PROMPTS
-        if "Option 1" in template_choice:
-            default_prompt = (
-                "I am uploading a PDF. Please extract the financial data/lists and present them in a Markdown table. "
-                "Ensure every row is filled and do not include any conversational text before or after the table. "
-                "Give me the table only."
-            )
+        with col_style:
+            template_choice = st.radio("Style:", ["Data Extraction (Table)", "Research Summary (Report)"])
+        
+        if "Data" in template_choice:
+            default_prompt = "Extract data into a Markdown table. No chat text, just the table."
         else:
-            default_prompt = (
-                "Please summarize this PDF into a formal report. Use Markdown headers (##) for each section, "
-                "use bullet points for key takeaways, and include a 'Conclusion' at the end. "
-                "Format this so it is ready to be exported into a professional document."
-            )
+            default_prompt = "Summarize this into a formal report with headers and bullet points."
 
-        user_prompt = st.text_area("Customize Instructions (Optional):", value=default_prompt, height=100)
+        user_prompt = st.text_area("Instructions:", value=default_prompt, height=100)
         
-        # 3. GENERATE
-        if st.button("✨ Generate Document"):
+        if st.button("✨ Generate"):
             try:
-                with st.spinner("AI is reading and writing your report..."):
-                    # Configure Gemini using SECURE KEY
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
-                    
-                    # Send Request
-                    full_prompt = f"{user_prompt}\n\nHere is the document text:\n{raw_text}"
-                    response = model.generate_content(full_prompt)
+                with st.spinner(f"Using {selected_model}..."):
+                    model = genai.GenerativeModel(selected_model)
+                    response = model.generate_content(f"{user_prompt}\n\nDocument:\n{raw_text}")
                     generated_text = response.text
                     
-                    st.subheader("Generated Result")
                     st.markdown(generated_text)
                     
-                    # 4. EXPORT TO WORD
                     doc = Document()
                     doc.add_heading('Generated Report', 0)
-                    
-                    # Simple markdown-to-word parser
                     for line in generated_text.split('\n'):
-                        clean_line = line.strip()
-                        if clean_line.startswith('## '):
-                            doc.add_heading(clean_line.replace('## ', ''), level=2)
-                        elif clean_line.startswith('# '):
-                            doc.add_heading(clean_line.replace('# ', ''), level=1)
-                        elif clean_line.startswith('* ') or clean_line.startswith('- '):
-                            doc.add_paragraph(clean_line.replace('* ', '').replace('- ', ''), style='List Bullet')
-                        else:
-                            if clean_line: doc.add_paragraph(clean_line)
-
-                    # Save to buffer
-                    doc_io = io.BytesIO()
-                    doc.save(doc_io)
-                    doc_io.seek(0)
+                        clean = line.strip()
+                        if clean.startswith('## '): doc.add_heading(clean[3:], level=2)
+                        elif clean.startswith('# '): doc.add_heading(clean[2:], level=1)
+                        elif clean.startswith('* ') or clean.startswith('- '): doc.add_paragraph(clean[2:], style='List Bullet')
+                        else: doc.add_paragraph(clean)
                     
-                    st.download_button(
-                        label="📥 Download as Word Doc (.docx)",
-                        data=doc_io,
-                        file_name="generated_report.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                    
+                    buf = io.BytesIO()
+                    doc.save(buf)
+                    buf.seek(0)
+                    st.download_button("📥 Download .docx", buf, "report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             except Exception as e:
-                st.error(f"AI Error: {e}. Check your API Key permissions.")
+                st.error(f"Error: {e}")
