@@ -4,3 +4,6 @@ openpyxl
 pdf2image
 pytesseract
 Pillow
+numpy
+google-generativeai
+python-docx
