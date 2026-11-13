@@ -45,7 +45,7 @@ if not check_password():
 # MAIN APP
 # ------------------------------------------------------------------
 st.title("🧠 Secure Smart Scan & Analyze Tool")
-tab1, tab2, tab3 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel", "📝 Generate Reports (Docs)"])
+tab1, tab2, tab3, tab4 = st.tabs(["📄 Scan PDF to Excel", "🤖 Analyze Excel", "📝 Generate Reports (Docs)", "📦 Packing list (local)"])
 
 # ------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -198,6 +198,227 @@ with tab2:
                 out = io.BytesIO()
                 with pd.ExcelWriter(out, engine='openpyxl') as writer: disp.to_excel(writer, index=False)
                 st.download_button("📥 Download Result", out.getvalue(), "result.xlsx")
+
+# ------------------------------------------------------------------
+# Local packing-list helpers (no OCR, AI, disk writes, or caching)
+# ------------------------------------------------------------------
+def packing_extract(data, kind, selected=None):
+    """Return positional columns and explicit source provenance, without guessing headers."""
+    rows = []
+    def add_table(source, table_number, table):
+        for row_number, row in enumerate(table, 1):
+            cells = ["" if v is None else str(v) for v in row]
+            if any(v.strip() for v in cells):
+                rows.append((source, str(table_number), str(row_number), cells))
+
+    if kind == "pdf":
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            pages = set(selected if selected is not None else range(1, len(pdf.pages) + 1))
+            for number, page in enumerate(pdf.pages, 1):
+                if number in pages:
+                    for table_number, table in enumerate(page.extract_tables(), 1):
+                        add_table(f"Page {number}", table_number, table)
+    elif kind == "docx":
+        doc = Document(io.BytesIO(data))
+        for number, table in enumerate(doc.tables, 1):
+            add_table("Document", number, [[cell.text for cell in row.cells] for row in table.rows])
+    elif kind == "xlsx":
+        from openpyxl import load_workbook
+        book = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+        try:
+            names = book.sheetnames if selected is None else selected
+            for name in names:
+                sheet = book[name]
+                add_table(name, 1, sheet.iter_rows(values_only=True))
+        finally:
+            book.close()
+    else:
+        raise ValueError("Unsupported format")
+    width = max((len(row[3]) for row in rows), default=0)
+    columns = ["Source", "Table", "Source row", "Group"] + [f"Column {i}" for i in range(1, width + 1)]
+    return pd.DataFrame([[source, table, number, ""] + cells + [""] * (width - len(cells))
+                         for source, table, number, cells in rows], columns=columns, dtype=str)
+
+
+def packing_totals(frame, mapping, units):
+    """Validate every row before producing any total. Numeric grammar is deliberately strict."""
+    from decimal import localcontext
+    metrics = ("Pieces", "Weight", "Amount")
+    problems = []
+    parsed = []
+    def text(value):
+        return "" if value is None or pd.isna(value) else str(value).strip()
+    if frame.empty:
+        return pd.DataFrame(), ["No rows to total."]
+    for pos, (_, row) in enumerate(frame.iterrows(), 1):
+        group = text(row.get("Group", ""))
+        if not group:
+            problems.append(f"Row {pos}: group is missing.")
+        values, row_units = {}, {}
+        for metric in metrics:
+            raw = text(row.get(mapping[metric], ""))
+            # Only plain decimal notation; commas, currency symbols, and exponent notation need correction.
+            if len(raw) > 100 or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", raw):
+                problems.append(f"Row {pos}: {metric.lower()} is missing or not a plain decimal number.")
+            else:
+                values[metric] = Decimal(raw)
+            mode, unit_value = units[metric]
+            unit = text(row.get(unit_value, "") if mode == "column" else unit_value)
+            if not unit:
+                problems.append(f"Row {pos}: {metric.lower()} unit is missing.")
+            row_units[metric] = unit
+        parsed.append((group, values, row_units))
+    seen = {}
+    for group, _, row_units in parsed:
+        for metric in metrics:
+            if group and row_units[metric]:
+                seen.setdefault((group, metric), set()).add(row_units[metric])
+    for (group, metric), found in seen.items():
+        if len(found) > 1:
+            problems.append(f"Group {group!r}: incompatible or inconsistent {metric.lower()} units; standardize them before totaling.")
+    if problems:
+        return pd.DataFrame(), problems
+    sums = {}
+    # At most 100 characters per number; extra digits allow for any number of rows.
+    with localcontext() as context:
+        context.prec = 205 + len(str(len(parsed)))
+        for group, values, row_units in parsed:
+            if group not in sums:
+                sums[group] = {metric: Decimal(0) for metric in metrics}
+                sums[group].update({metric + " unit": row_units[metric] for metric in metrics})
+            for metric in metrics:
+                sums[group][metric] += values[metric]
+    result = []
+    for group in sorted(sums):
+        item = {"Group": group}
+        for metric in metrics:
+            item[metric] = format(sums[group][metric], "f")
+            item[metric + " unit"] = sums[group][metric + " unit"]
+        result.append(item)
+    return pd.DataFrame(result), []
+
+
+def packing_export(frame, totals):
+    """Generate an in-memory workbook; treat formula-looking text as literal."""
+    from openpyxl import Workbook
+    def safe(value):
+        text = "" if value is None else str(value)
+        if text.lstrip(" \t\r\n\v\f").startswith(("=", "+", "-", "@")):
+            return "'" + text
+        return text
+    book = Workbook()
+    for sheet, data in ((book.active, frame), (book.create_sheet(), totals)):
+        sheet.title = "Rows" if sheet == book.active else "Totals"
+        sheet.append([safe(c) for c in data.columns])
+        for row in data.itertuples(index=False, name=None):
+            sheet.append([safe(v) for v in row])
+    output = io.BytesIO()
+    book.save(output)
+    return output.getvalue()
+
+
+def packing_pdf_preview(data, page_number, scale=1.5):
+    """Render one original PDF page in memory; no OCR or text interpretation."""
+    import pypdfium2 as pdfium
+    document = pdfium.PdfDocument(data)
+    try:
+        if not 1 <= page_number <= len(document):
+            raise ValueError("Page number out of range")
+        page = document[page_number - 1]
+        try:
+            bitmap = page.render(scale=scale, draw_annots=True)
+            try:
+                return bitmap.to_pil().copy()
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    finally:
+        document.close()
+
+
+with tab4:
+    import hashlib
+    st.header("4. Packing-list grouping (local only)")
+    st.warning("Handwriting, including handwritten group numbers, is NOT recognized. Read the original document and manually enter the group for every row. Do not assume handwritten marks were extracted.")
+    st.caption("This experimental tab processes the uploaded file in memory without AI or OCR. Other tabs have separate behavior. PDF extraction requires detectable embedded-text tables; review every row against the original.")
+    packing_file = st.file_uploader("Upload a packing list", type=["pdf", "docx", "xlsx"], key="packing_file")
+    if packing_file:
+        try:
+            contents = packing_file.getvalue()
+            kind = packing_file.name.rsplit(".", 1)[-1].lower()
+            file_key = hashlib.sha256(contents).hexdigest()
+            selected = None
+            if kind == "pdf":
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(contents)) as pdf:
+                    page_options = list(range(1, len(pdf.pages) + 1))
+                selected = st.multiselect("PDF pages", page_options, default=page_options, key="pack_pages_" + file_key)
+            elif kind == "xlsx":
+                from openpyxl import load_workbook
+                book = load_workbook(io.BytesIO(contents), read_only=True, data_only=False)
+                try:
+                    sheet_options = book.sheetnames
+                finally:
+                    book.close()
+                selected = st.multiselect("Excel sheets", sheet_options, default=sheet_options, key="pack_sheets_" + file_key)
+            extracted = packing_extract(contents, kind, selected)
+            if kind == "pdf":
+                preview_col, data_col = st.columns([1, 2])
+                with preview_col:
+                    st.subheader("Original PDF page")
+                    st.caption("Visual comparison only; handwriting is not read or interpreted. Verify the original locally if any marks are missing from the preview. Use Source and Source row to match rows, and manually enter each group.")
+                    if selected:
+                        preview_page = st.selectbox("Page to view", selected, key="pack_preview_" + file_key)
+                        try:
+                            st.image(packing_pdf_preview(contents, preview_page), use_container_width=True)
+                        except Exception:
+                            st.warning("Page preview unavailable. Open the original PDF locally for comparison; do not enter groups without checking it.")
+                    else:
+                        st.info("Select a PDF page to preview it.")
+            else:
+                data_col = st.container()
+            with data_col:
+                if extracted.empty:
+                    st.warning("No table rows found in the selection. Image-only PDFs are not supported.")
+                    edited = None
+                else:
+                    st.info("Rows include headers when present: delete non-data rows, correct cells, and manually enter a group for every row. Source and row provenance are editable; verify them before export.")
+                    editor_key = "pack_edit_" + hashlib.sha256((file_key + repr(selected)).encode()).hexdigest()
+                    edited = st.data_editor(extracted, num_rows="dynamic", use_container_width=True, key=editor_key)
+            if edited is not None:
+                candidates = [c for c in edited.columns if c.startswith("Column ")]
+                if candidates:
+                    st.subheader("Map numeric columns and units")
+                    st.caption("Use plain decimal numbers only (no separators, symbols, or exponents). Specify a unit or currency for each metric, or map a unit column. Mixed units within a group block all totals; no conversions are performed.")
+                    mapping, units = {}, {}
+                    for metric in ("Pieces", "Weight", "Amount"):
+                        mapping[metric] = st.selectbox(metric + " column", [""] + candidates, key="pack_map_" + metric)
+                        mode = st.radio(metric + " unit source", ["Fixed unit", "Column"], horizontal=True, key="pack_mode_" + metric)
+                        if mode == "Column":
+                            unit_col = st.selectbox(metric + " unit column", [""] + candidates, key="pack_unit_col_" + metric)
+                            units[metric] = ("column", unit_col)
+                        else:
+                            units[metric] = ("fixed", st.text_input(metric + " unit / currency", key="pack_unit_" + metric))
+                    if all(mapping.values()) and all(mode != "column" or value for mode, value in units.values()):
+                        if len(set(mapping.values())) != 3:
+                            st.warning("Choose a different numeric column for each metric.")
+                        else:
+                            totals, problems = packing_totals(edited, mapping, units)
+                            if problems:
+                                st.warning("Totals and export are blocked until all issues are fixed.")
+                                for problem in problems:
+                                    st.text(problem)
+                            else:
+                                st.subheader("Validated totals")
+                                st.dataframe(totals, use_container_width=True)
+                                st.download_button("Download rows and totals (.xlsx)", packing_export(edited, totals), "packing_totals.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="pack_download")
+                    else:
+                        st.info("Map all three numeric columns and any selected unit columns to calculate.")
+        except Exception:
+            st.error("Could not process this file. Check its format and contents, then try again.")
+
 
 # ------------------------------------------------------------------
 # TAB 3: GENERATE REPORTS (AUTO-DETECT MODEL)

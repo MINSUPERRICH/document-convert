@@ -7,3 +7,5 @@ Pillow
 numpy
 google-generativeai
 python-docx
+pdfplumber
+pypdfium2
